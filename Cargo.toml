@@ -1,0 +1,48 @@
+[package]
+name = "nvstereo3d"
+version = "0.1.0"
+edition = "2021"
+description = "NVIDIA 3D Vision OpenGL demo (3dv3d) + Linux host helper (nvstereo3d-host) for the USB IR emitter"
+license = "MIT OR Apache-2.0"
+rust-version = "1.70"
+
+# `cargo run` builds the default binary = the 3dv3d demo.
+default-run = "3dv3d"
+
+[lib]
+name = "nvstereo3d"
+path = "src/lib.rs"
+
+[[bin]]
+name = "3dv3d"
+path = "src/bin/3dv3d.rs"
+
+[[bin]]
+name = "nvstereo3d-host"
+path = "src/bin/nvstereo3d-host.rs"
+
+# Shared: 3dv3d demo + host both drive the same NVIDIA 3D Vision USB emitter.
+[dependencies]
+rusb = "0.9"
+
+# --- 3dv3d (OpenGL GLUT-style demo) ---------------------------------------
+glutin = "0.32.3"
+glutin-winit = "0.5.0"
+winit = "0.30.13"
+libloading = "0.8"
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-protocols = "0.32"
+wayland-egl = "0.32"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+
+# --- nvstereo3d-host (shared-memory ring + DRM vblank anchor) -------------
+memmap2 = "0.9"
+libc = "0.2"
+
+[build-dependencies]
+gl_generator = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
