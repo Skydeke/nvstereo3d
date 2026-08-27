@@ -15,7 +15,7 @@ pub mod x11glx;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -116,185 +116,7 @@ pub struct Keys {
     pub toggled_3d: bool,
 }
 
-/// Method 5 (paced) fallback stream: a dedicated thread that emits the
-/// alternating left/right eye packets on a monotonic clock at the configured
-/// refresh period, keeping the RP2040's master mode locked (it needs a steady
-/// 7600-9000 us alternating packet stream) even when neither the GLX video
-/// sync nor a DRM vblank anchor correlates with the real display vblank -
-/// i.e. windowed/composited desktops.  `phase_us` is the offset of the packet
-/// stream against the render loop's present instants; it is AtomicI64 because
-/// the main thread's `,`/`.` phase tuning (`set_swap_phase_us`) retargets it
-/// live.
-struct PacedStream {
-    running: Arc<AtomicBool>,
-    phase_us: Arc<AtomicI64>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-/// Shared frame-present anchor.  The render loop records the instant its swap
-/// (present) returns every frame.  With vsync/swap-interval this is within a
-/// bounded latency of the real vblank / on-screen frame boundary - a much
-/// steadier reference than any process-local clock for *relative* phase.  The
-/// paced stream (method 5) locks its packet schedule to these instants, so
-/// sweeping the phase with the `,`/`.` keys deterministically moves the
-/// shutter switch across the actual image boundaries (a free-running stream's
-/// re-anchor lands on an arbitrary `Instant::now()` and cannot be swept
-/// reliably by hand).
-///
-/// The raw swap-return instants carry ~0.5 ms of scheduler/compositor jitter,
-/// so the anchor runs a phase-locked estimator (see [`PresentPll`]): it tracks
-/// the *mean* present phase and period and predicts the next present.  The
-/// paced stream locks its packet grid to that prediction instead of to each
-/// noisy sample, which is what previously smeared the `,`/`.` null band into
-/// alternating flicker.
-struct PresentAnchor {
-    base: Instant,
-    last_us: AtomicI64,
-    /// Predicted instant (us since `base`) of the next present, per the PLL.
-    next_us: AtomicI64,
-    /// Smoothed present period (us), for diagnostics / fallback.
-    period_us: AtomicI64,
-    /// Filter state; only written from the render (main) thread via `notify`
-    /// (the paced thread never locks it - it only reads the atomics above, so
-    /// the Mutex is contention-free and only needed to keep this Sync).
-    pll: Mutex<PresentPll>,
-}
-
-/// Phase-locked estimator for the frame-present clock.  [`PresentPll::notify`]
-/// is called once per rendered frame; it nudges a nominal present time toward
-/// each sample (attenuating jitter) and maintains a smoothed period.  The
-/// predicted next present is `tick + period`.
-struct PresentPll {
-    /// Filtered estimate of the current (latest) present, us since `base`.
-    tick_us: f64,
-    /// Smoothed period between presents, us.
-    period_us: f64,
-    last_sample_us: i64,
-    samples: u32,
-    err_sq_sum: f64,
-    locked_reported: bool,
-}
-
-/// How much each observed present is allowed to move the nominal present
-/// phase (1.0 would follow every sample; lower attenuates the swap-return
-/// jitter but still converges on the mean present).
-const PRESENT_PHASE_GAIN: f64 = 0.2;
-/// How fast the smoothed present period tracks measured frame-to-frame
-/// deltas.  The display clock is crystal-stable, so a low gain keeps the
-/// period estimate quiet.
-const PRESENT_PERIOD_GAIN: f64 = 0.05;
-
-impl PresentAnchor {
-    fn new() -> Self {
-        Self {
-            base: Instant::now(),
-            last_us: AtomicI64::new(-1),
-            next_us: AtomicI64::new(-1),
-            period_us: AtomicI64::new(0),
-            pll: Mutex::new(PresentPll::new()),
-        }
-    }
-
-    /// Records the current instant as the latest present and advances the
-    /// phase-locked prediction of the next present.
-    fn notify(&self) {
-        let us = self.base.elapsed().as_micros() as i64;
-        self.last_us.store(us, Ordering::Relaxed);
-        if let Ok(mut pll) = self.pll.lock() {
-            pll.notify(us);
-            self.next_us.store(
-                (pll.tick_us + pll.period_us).round() as i64,
-                Ordering::Relaxed,
-            );
-            self.period_us
-                .store(pll.period_us.round() as i64, Ordering::Relaxed);
-        }
-    }
-
-    /// The instant of the most recent present, if any.
-    fn last(&self) -> Option<Instant> {
-        let us = self.last_us.load(Ordering::Relaxed);
-        if us < 0 {
-            None
-        } else {
-            Some(self.base + Duration::from_micros(us as u64))
-        }
-    }
-
-    /// The predicted instant of the next present, if the clock has seen at
-    /// least one sample.
-    fn next(&self) -> Option<Instant> {
-        let us = self.next_us.load(Ordering::Relaxed);
-        if us < 0 {
-            None
-        } else {
-            Some(self.base + Duration::from_micros(us as u64))
-        }
-    }
-}
-
-impl PresentPll {
-    fn new() -> Self {
-        Self {
-            tick_us: 0.0,
-            // 120 Hz default; corrected from the first frame-to-frame delta.
-            period_us: 8333.0,
-            last_sample_us: -1,
-            samples: 0,
-            err_sq_sum: 0.0,
-            locked_reported: false,
-        }
-    }
-
-    fn notify(&mut self, t: i64) {
-        if self.last_sample_us < 0 {
-            self.tick_us = t as f64;
-            self.last_sample_us = t;
-            self.samples = 1;
-            return;
-        }
-
-        let dt = (t - self.last_sample_us) as f64;
-        self.last_sample_us = t;
-
-        // Period tracking: only accept plausible frame-to-frame deltas so a
-        // stall or doubled present can't corrupt the smoothed period.
-        if dt > 0.5 * self.period_us && dt < 1.5 * self.period_us {
-            self.period_us += PRESENT_PERIOD_GAIN * (dt - self.period_us);
-        }
-
-        self.samples += 1;
-
-        // Phase tracking: nudge the nominal present toward this sample,
-        // attenuating the swap-return jitter.  The samples arrive exactly one
-        // period apart, so the raw error t - tick is always ~period; wrap it
-        // into [-period/2, +period/2] FIRST or the filter would judge every
-        // sample "out of range" and resync to it verbatim (i.e. the PLL would
-        // do nothing - the old bug made the "smoothing" a raw-anchor no-op,
-        // which is why the flicker never improved).  A missed/doubled present
-        // shows up as a wrapped error near zero and just doesn't move the
-        // phase, which is exactly what we want.
-        let mut err = (t as f64 - self.tick_us).rem_euclid(self.period_us);
-        let half = self.period_us / 2.0;
-        if err > half {
-            err -= self.period_us;
-        }
-        self.tick_us += PRESENT_PHASE_GAIN * err;
-        // Ignore the warm-up samples when reporting residual jitter.
-        if self.samples >= 10 {
-            self.err_sq_sum += err * err;
-        }
-
-        if !self.locked_reported && self.samples >= 60 {
-            self.locked_reported = true;
-            let rms = (self.err_sq_sum / self.samples.saturating_sub(9) as f64).sqrt();
-            eprintln!(
-                "nvstusb: present PLL locked: period={:.0}us jitter_rms={:.0}us",
-                self.period_us, rms
-            );
-        }
-    }
-}
+/// Context for communicating with the NVIDIA 3D Vision IR emitter.
 
 /// Context for communicating with the NVIDIA 3D Vision IR emitter.
 pub struct NvstusbContext {
@@ -335,15 +157,75 @@ pub struct NvstusbContext {
     /// provisional starting guess; the real decision is re-derived from the
     /// measured present error by [`Self::update_kms_inversion`].
     kms_vsync_throttled: bool,
-    /// Method 5 (paced) fallback stream, if active.
-    paced: Option<PacedStream>,
-    /// Frame-present anchor feed by the render loop (see [`PresentAnchor`]).
-    present: Arc<PresentAnchor>,
-    /// Native-Wayland presentation-time anchor (see [`wayland::WaylandPresent`]),
-    /// fed by the Wayland backend's `wp_presentation_feedback`. On a composited
-    /// desktop this is the only clock phase-locked to the *surface's* present,
-    /// so the paced stream prefers it over the DRM/OML anchors.
-    wayland_present: Option<Arc<wayland::WaylandPresent>>,
+    /// Method 1, present feedback (OML): instant of the most recent confirmed
+    /// on-screen present and the smoothed interval between presents.
+    present_instant: Option<Instant>,
+    vsync_period_us: u64,
+    /// Method 1, present feedback: app Xlib display pointer and drawable that
+    /// back the GL surface; both zero/unset when unavailable, which disables
+    /// OML attribution and degrades to boundary-only pacing.
+    x11_display: usize,
+    x11_drawable: u64,
+    /// SBC snapshot taken just before each swap (method 1); a later increase
+    /// in the OML swap-block counter confirms the buffer actually reached the
+    /// screen.
+    pre_swap_sbc: i64,
+    /// Whether a swap is awaiting present confirmation.
+    pending_confirm: bool,
+    /// Return instant of the swap before last (method 1), for gap anomalies.
+    prev_swap_return: Option<Instant>,
+    /// Wayland/EGL present clock (method 1 on native Wayland): a private EGL
+    /// display (the same singleton the app's EGL uses) plus a shadow window
+    /// surface over the app's `wl_surface`, used only to read the hardware
+    /// vblank counter via `eglGetSyncValuesCHROMIUM`.  Never rendered to and
+    /// never swapped, so it cannot interfere with the app's buffers.
+    egl_clock: Option<EglClock>,
+    /// Kernel DRM vblank clock (method 1 on native Wayland): true hardware
+    /// boundary timestamps straight from WAIT_VBLANK, no DRM master needed.
+    /// Anchoring packets to this grid removes the ppm-level beat between the
+    /// compositor's callback clock and the display crystal, which made the
+    /// flip point sweep through the frame (seen as a red->blue gradient).
+    drm_clock: Option<DrmVblank>,
+    /// Whether the lazy DRM probe already ran (avoids retry spam).
+    drm_tried: bool,
+    /// Normalized name of the output (wl_output / kernel connector) the app
+    /// window is currently displayed on, e.g. `dp-1`. The method-1 kernel
+    /// anchor is (re-)opened on the CRTC serving THAT output; on a multi-head
+    /// GPU each head's vblank grid has an arbitrary phase offset to its
+    /// siblings, so anchoring to the wrong one shifts the IR flip into the
+    /// scanout - visible through shutter glasses as a top/bottom colour split.
+    /// `None` = unknown (blind first-pipe behavior).
+    target_connector: Option<String>,
+    /// Runtime anchor-pipe override cycled by the demo's `o` key:
+    /// 0 = auto (window output / first active head), 1..=8 = CRTC pipe
+    /// index 0..=7. Exists for drivers that refuse connector enumeration to
+    /// plain clients (nvidia-drm without DRM master): there the name binding
+    /// cannot engage and only the user's eyes can pick the right vblank grid.
+    pipe_cycle: u32,
+    /// Return instant of the previous swap (method 1), for gap anomalies.
+    last_swap_return: Option<Instant>,
+    /// Boundary the previous packet was scheduled against (target + lead).
+    /// Used to tell "packet slipped to a later boundary together with the
+    /// throttled present" (render stall - pairing survives on its own) apart
+    /// from "packet stayed on schedule but content lost a cycle" (compositor
+    /// hiccup - glasses must hold via suppression).
+    last_packet_boundary: Option<Instant>,
+    /// Set when a swap-gap anomaly shows content held an extra boundary;
+    /// suppresses one packet so the glasses hold in lockstep.
+    suppress_next_packet: bool,
+}
+
+/// Runtime-loaded EGL entry points + handles backing [`NvstusbContext::egl_clock`].
+struct EglClock {
+    dpy: usize,
+    surf: usize,
+    get_sync_values: unsafe extern "C" fn(
+        dpy: usize,
+        surface: usize,
+        ust: *mut i64,
+        msc: *mut i64,
+        sbc: *mut i64,
+    ) -> u32,
 }
 
 /// Initializes the controller: opens the USB device (uploading `nvstusb.fw`
@@ -391,11 +273,12 @@ pub fn init() -> Option<NvstusbContext> {
     let swap_phase_us = match vblank_method {
         // Method 4: host lead before the boundary (~USB write time).
         4 => 75,
-        // Method 5 (paced): with the DRM vblank anchor, this is the offset of
-        // the shutter IR fire from the display boundary; start at the boundary
-        // and sweep with ,/. from there.
-        5 => 0,
-        _ => 2080,
+        // Method 1 (GLX video sync): lead of the eye packet before the next
+        // vblank boundary. The firmware fires the IR one alarm delay
+        // (3000 us) after arrival, so 3100 us puts the shutter flip ~100 us
+        // ahead of the boundary - the same fixed lead the NVIDIA driver
+        // kept. Sweep with `,`/`.`.
+        _ => 3100,
     };
 
     Some(NvstusbContext {
@@ -412,9 +295,21 @@ pub fn init() -> Option<NvstusbContext> {
         thread: None,
         glx,
         kms_vsync_throttled: true,
-        paced: None,
-        present: Arc::new(PresentAnchor::new()),
-        wayland_present: None,
+        present_instant: None,
+        vsync_period_us: 8333,
+        x11_display: 0,
+        x11_drawable: 0,
+        pre_swap_sbc: -1,
+        pending_confirm: false,
+        prev_swap_return: None,
+        egl_clock: None,
+        drm_clock: None,
+        drm_tried: false,
+        target_connector: None,
+        pipe_cycle: 0,
+        last_swap_return: None,
+        last_packet_boundary: None,
+        suppress_next_packet: false,
     })
 }
 
@@ -434,12 +329,6 @@ impl NvstusbContext {
         }
 
         self.rate = rate;
-
-        // Method 5: (re)start the paced packet stream now that the emitter is
-        // configured and enabled; it needs the rate for the frame period.
-        if self.vblank_method == 5 {
-            self.start_paced();
-        }
     }
 
     /// Sets the RP2040 clone's packet -> IR delay in microseconds (control
@@ -464,39 +353,147 @@ impl NvstusbContext {
         self.rate
     }
 
-    /// Host-side post-swap phase delay in microseconds.
+    /// Host-side packet lead in microseconds.
     pub fn swap_phase_us(&self) -> u32 {
         self.swap_phase_us
     }
 
-    /// Sets the host-side post-swap phase delay (us). The delay runs after
-    /// swap_buffers returns so the next eye packet's IR fire lands just before
-    /// the frame boundary.  For method 5 (paced) it is the offset of the paced
-    /// packet stream against the render loop's present instants, retargeted
-    /// live so `,`/`.` tuning moves the IR frames against the display without
-    /// restarting the stream.
+    /// Sets the host-side packet lead (us).  Method 1 sends the eye packet
+    /// this many microseconds before the next vblank boundary, so the IR
+    /// flip lands at `boundary - lead + alarm delay`; `,`/`.` tuning moves
+    /// the shutter switch across the image boundary live.
     pub fn set_swap_phase_us(&mut self, us: u32) {
         self.swap_phase_us = us;
-        if let Some(p) = self.paced.as_ref() {
-            p.phase_us.store(us as i64, Ordering::Relaxed);
+    }
+
+    /// Names the active method-1 pacing anchor for diagnostics. Includes the
+    /// anchored display (`DP-1/pipe1`) so a wrong-head bind is visible in the
+    /// once-per-second perf report.
+    pub fn anchor_name(&self) -> String {
+        if let Some(d) = self.drm_clock.as_ref() {
+            format!("drm-vblank[{}]", d.label())
+        } else if let Some(d) = self.drm_vblank.as_ref() {
+            format!("drm-vblank[{}]", d.label())
+        } else if self.egl_clock.is_some() {
+            "egl-msc".to_string()
+        } else if self.x11_display != 0 {
+            "oml-sbc".to_string()
+        } else {
+            "swap-return".to_string()
         }
     }
 
-    /// Records the frame-present instant.  Call right after the swap (present)
-    /// returns.  The paced stream (method 5) locks its packet schedule to
-    /// these instants so the shutter phase can be tuned against real frame
-    /// boundaries.
-    pub fn notify_present(&self) {
-        self.present.notify();
+    /// Tells the context which output (wl_output name == kernel connector
+    /// name, e.g. `DP-1`) the app window is displayed on, so the kernel
+    /// vblank anchor can be bound to that head's CRTC instead of whatever
+    /// pipe happens to be index 0 on a multi-monitor GPU.
+    ///
+    /// Called again whenever the window moves to another output; that drops
+    /// the current anchor and re-opens it on the new CRTC at the next frame.
+    pub fn set_target_connector(&mut self, name: Option<&str>) {
+        let norm = name.map(crate::nvstusb::drm::normalize_connector_name);
+        if norm == self.target_connector {
+            return;
+        }
+        eprintln!(
+            "nvstusb: window output {:?} -> {:?}; re-targeting vblank anchor",
+            self.target_connector.as_deref(),
+            norm.as_deref(),
+        );
+        self.target_connector = norm;
+        // Only the lazy method-1 clock follows the window; the KMS path's
+        // `drm_vblank` is bound at init to the card we mode-set ourselves.
+        if self.drm_clock.take().is_some() {
+            eprintln!(
+                "nvstusb: dropped DRM vblank anchor; re-opening on the new CRTC \
+                 (one-frame hiccup expected)"
+            );
+        }
+        self.drm_tried = false;
+        // The new CRTC's vblank grid is an unrelated timeline: forget which
+        // boundary the previous packet rode on so the next frame can't be
+        // misread as a slipped-together render stall.
+        self.last_packet_boundary = None;
     }
 
-    /// Installs the native-Wayland presentation-time anchor so the paced
-    /// stream (method 5) locks its packet schedule to the compositor's
-    /// `wp_presentation_feedback` ground truth instead of the DRM/OML anchors,
-    /// which do not correlate with a composited surface's present. Call with
-    /// the `WaylandDisplay.present` anchor once the Wayland backend is up.
-    pub fn set_wayland_present(&mut self, present: Arc<wayland::WaylandPresent>) {
-        self.wayland_present = Some(present);
+    /// Runtime escape hatch for the demo's `o` key: steps
+    /// auto -> pipe0 -> pipe1 ... -> pipe7 -> auto. Each press drops and
+    /// re-opens the kernel vblank anchor on the next CRTC pipe, so on drivers
+    /// that hide connector names from plain clients (nvidia-drm without DRM
+    /// master) the user can still move the IR flip onto the head that is
+    /// actually showing the window - watch the blue/red scene, stop when the
+    /// split disappears. No-op outside vblank method 1 (nothing else uses the
+    /// lazy `drm_clock`).
+    pub fn cycle_anchor_pipe(&mut self) {
+        if self.vblank_method != 1 {
+            return;
+        }
+        self.pipe_cycle = (self.pipe_cycle + 1) % 9;
+        let label = if self.pipe_cycle == 0 {
+            "auto".to_string()
+        } else {
+            format!("pipe{}", self.pipe_cycle - 1)
+        };
+        eprintln!("nvstusb: anchor pipe override -> {label}");
+        if self.drm_clock.take().is_some() {
+            eprintln!("nvstusb: re-opening the anchor (one-frame hiccup expected)");
+        }
+        self.drm_tried = false;
+        // The new CRTC's vblank grid is an unrelated timeline: forget which
+        // boundary the previous packet rode on so the next frame can't be
+        // misread as a slipped-together render stall.
+        self.last_packet_boundary = None;
+    }
+
+    /// Installs the app's Xlib display + drawable so method 1 can read OML
+    /// sync values (`glXGetSyncValuesOML`) for the *real* GL surface.  The
+    /// SBC from that call is what lets the paced stream follow actual
+    /// on-screen presents instead of raw vblank ticks - required on a
+    /// composited desktop, where the compositor can delay or repeat a frame.
+    /// Call once per process, after the window exists; without it method 1
+    /// falls back to pacing against video-sync boundaries only.
+    pub fn set_x11_target(&mut self, display: usize, drawable: u64) {
+        if display == 0 || drawable == 0 {
+            return;
+        }
+        self.x11_display = display;
+        self.x11_drawable = drawable;
+        eprintln!(
+            "nvstusb: present feedback armed (OML sync values on drawable {:#x})",
+            drawable
+        );
+    }
+
+    /// Arms the Wayland/EGL present clock: opens the EGL display singleton
+    /// for the app's `wl_display` and creates a shadow window surface over
+    /// the app's `wl_surface`, used purely to read the hardware vblank
+    /// counter (`eglGetSyncValuesCHROMIUM`).  The shadow surface is never
+    /// rendered into nor swapped, so it does not touch the app's buffer
+    /// queue.  On failure the field stays unset and pacing degrades to the
+    /// swap-return anchor.
+    pub fn set_wayland_target(&mut self, wl_display: usize, wl_surface: usize) {
+        if wl_display == 0 || wl_surface == 0 || self.egl_clock.is_some() {
+            return;
+        }
+        match unsafe { egl_clock_new(wl_display, wl_surface) } {
+            Ok(clock) => {
+                eprintln!(
+                    "nvstusb: present clock armed (EGL sync values, shadow surface {:#x})",
+                    wl_surface
+                );
+                self.egl_clock = Some(clock);
+            }
+            Err(e) => {
+                if self.drm_clock.is_some() {
+                    eprintln!(
+                        "nvstusb: EGL present clock unavailable ({e}); \
+                         kernel vblank anchor active"
+                    );
+                } else {
+                    eprintln!("nvstusb: EGL present clock unavailable ({e}); using swap anchor");
+                }
+            }
+        }
     }
 
     /// Selected vblank method (0 = software, 1 = GLX_SGI_video_sync,
@@ -741,33 +738,167 @@ impl NvstusbContext {
                 );
                 self.set_eye(eye);
             }
-            // GLX_SGI_video_sync: on X11 this can wait for vblank, but on
-            // native Wayland glXWaitVideoSyncSGI is a no-op (observed: returns
-            // in ~0us), so the packet position within the frame was random and
-            // the IR fired ~5ms too early.  We instead anchor to swap_buffers
-            // itself (which blocks until the compositor presents) and push the
-            // shutter packet one frame ahead with a host-side phase delay so
-            // the IR lands ~1-2ms before the frame boundary.  Tune with ,/. ,
-            // coarse with [ ].
+            // GLX_SGI_video_sync + OML present feedback, NVIDIA-contract
+            // pacing: send the eye packet `swap_phase_us` before the
+            // boundary where this frame will ACTUALLY appear, then call the
+            // blocking swap.  On a composited desktop raw vblank ticks are
+            // not enough: the compositor can repeat or delay a buffer, and
+            // one such hiccup leaves glasses and content permanently
+            // opposite (alternating correct/inverted = "terrible sync").
+            // So after each swap we confirm the present via the OML SBC
+            // (swap-block counter) and pace the next packet against the
+            // confirmed present instant.  If rendering finishes too late
+            // for the predicted present, the packet AND the present slip
+            // one period together - pairing survives skips.
             1 => {
-                self.set_eye(eye);
-                swap_func();
-                if self.swap_phase_us > 0 {
-                    precise_sleep(self.swap_phase_us as u64);
+                // Attribute the previous frame's present first (bounded).
+                self.confirm_last_present();
+
+                let period = Duration::from_micros(self.vsync_period_us);
+
+                // Swap-gap anomaly: if the previous swap returned more than
+                // ~1.25 periods after its predecessor, content held an extra
+                // boundary somewhere (render stall or compositor hiccup).
+                // Whether the glasses must hold too depends on which side
+                // slipped - decided below once this packet's boundary is
+                // known.
+                let mut missed_cycle = false;
+                if let (Some(prev), Some(last)) =
+                    (self.prev_swap_return, self.last_swap_return)
+                {
+                    let dt = last.duration_since(prev);
+                    if dt > period + period / 4 && dt < period * 8 {
+                        missed_cycle = true;
+                    }
                 }
+                self.prev_swap_return = self.last_swap_return;
+
+                // Anchor: with the kernel vblank clock armed (native
+                // Wayland), fire at a fixed phase of the *display's* own
+                // timeline instead of the compositor's callback clock.
+                // Callback-clock jitter used to smear the flip position
+                // across the scanout (seen as a red->blue gradient on the
+                // alternating-color scene).
+                //
+                // Placement model: the packet arrives ~lead us before the
+                // boundary, the firmware fires IR 3000 us later, so the
+                // shutter flips at ~b_next - lead + 3000 + usb.  The kernel
+                // timestamp is the START of blanking (~230 us at
+                // 1440p120), so the default 3100 lands the flip just
+                // inside the blanking interval - tune with `,`/`.`.
+                // Armed lazily, only when no better ground truth exists:
+                // X11 keeps OML SBC attribution, EGL-sync-values systems
+                // keep that clock.  WAIT_VBLANK needs no DRM master, so it
+                // works in windowed mode alongside the compositor and also
+                // seeds the true measured period (8336 us at 119.953 Hz,
+                // not the nominal 120 Hz value).
+                //
+                // The anchor is opened on the CRTC serving the output the
+                // window is on (`target_connector`): on multi-head GPUs the
+                // heads' vblank grids are phase-offset arbitrarily, and
+                // packets paced off the wrong head land mid-scanout.
+                if !self.drm_tried
+                    && self.x11_display == 0
+                    && self.egl_clock.is_none()
+                {
+                    self.drm_tried = true;
+                    // pipe_cycle == 0 -> auto (bind by window output, else
+                    // first active head); 1..=8 -> explicit CRTC pipe index.
+                    let force_pipe = if self.pipe_cycle == 0 {
+                        None
+                    } else {
+                        Some(self.pipe_cycle - 1)
+                    };
+                    self.drm_clock = DrmVblank::open_preferring(
+                        if force_pipe.is_none() {
+                            self.target_connector.as_deref()
+                        } else {
+                            None
+                        },
+                        force_pipe,
+                    );
+                    if let Some(d) = &self.drm_clock {
+                        self.vsync_period_us = d.period_us();
+                    }
+                }
+                let now = Instant::now();
+                let mut drm_target = None;
+                let lead = Duration::from_micros((self.swap_phase_us as u64).min(7000));
+                if let Some(drm) = self.drm_clock.as_mut() {
+                    match drm.query_vblank() {
+                        Some(b_prev) => {
+                            let b_next = b_prev + drm.period_us();
+                            drm_target = Some(drm.instant_of(b_next) - lead);
+                        }
+                        None => {} // transient ioctl failure: legacy anchor
+                    }
+                }
+                let mut target = match drm_target {
+                    Some(t) => t,
+                    None => match self.present_instant {
+                        Some(t) => t + period,
+                        None => {
+                            // No confirmed present yet: seed from a video-sync tick.
+                            self.wait_vblank_boundary() + period
+                        }
+                    },
+                };
+                // Late render: skip to the next boundary with the packet.
+                while target.checked_duration_since(now).map_or(true, |d| d <= lead)
+                {
+                    target += period;
+                }
+
+                // Classify a missed cycle by where THIS packet ended up:
+                //
+                // Render stall - rendering blew past one or more boundaries,
+                // so the skip loop above pushed this packet to a later
+                // boundary, exactly where the throttled present lands too.
+                // Packet and content slip together; pairing survives on its
+                // own and suppressing an extra packet would BREAK it (the
+                // glasses hold while the content advances - one inverted
+                // cycle, visible as a transient split/gradient).
+                //
+                // Compositor hiccup - the app submitted on time so the packet
+                // is still on its regular next boundary, but the buffer flip
+                // missed the deadline and content repeated for a cycle.  Now
+                // the glasses must hold via suppression to stay paired.
+                let boundary = target + lead;
+                let slipped_together = match self.last_packet_boundary {
+                    Some(prev_b) => {
+                        let d = boundary.saturating_duration_since(prev_b);
+                        d > period + period / 4 && d < period * 16
+                    }
+                    None => false,
+                };
+                self.last_packet_boundary = Some(boundary);
+                if missed_cycle && !slipped_together {
+                    self.suppress_next_packet = true;
+                }
+
+                if let Some(wait) =
+                    target.checked_sub(lead).and_then(|t| t.checked_duration_since(now))
+                {
+                    precise_sleep(wait.as_micros() as u64);
+                }
+                if self.suppress_next_packet {
+                    // Glasses hold this boundary in lockstep with content.
+                    self.suppress_next_packet = false;
+                } else {
+                    self.pre_swap_sbc =
+                        self.read_present_counter().unwrap_or(self.pre_swap_sbc);
+                    self.set_eye(eye);
+                    if self.x11_display != 0 || self.egl_clock.is_some() {
+                        self.pending_confirm = true;
+                    }
+                }
+                swap_func();
+                self.last_swap_return = Some(Instant::now());
             }
             // __GL_SYNC_TO_VBLANK is defined: the driver does the syncing.
             2 => {
                 swap_func();
                 self.set_eye(eye);
-            }
-            // Paced fallback: a dedicated thread emits the alternating eye
-            // packets on a monotonic clock (see start_paced), so the RP2040
-            // master lock and steady 120 Hz IR are guaranteed regardless of
-            // how (or whether) the present blocks on a real vblank.  The
-            // render loop only presents here; phase is tuned with ,/./[ ].
-            5 => {
-                swap_func();
             }
             // DRM/KMS vblank anchor: busy-wait until `next present vblank -
             // 3000 - lead`, send the eye packet, then swap blocks to that same
@@ -903,267 +1034,107 @@ impl NvstusbContext {
         }
     }
 
-    /// Starts the paced eye-packet stream (method 5).  A dedicated thread
-    /// emits alternating left/right packets on a monotonic clock at the
-    /// configured refresh period, so the RP2040 sees the steady 7600-9000 us
-    /// alternating stream it requires to lock master mode and fire IR at the
-    /// display rate - even when the render loop's present does not block on a
-    /// real vblank (composited/Wayland desktops).  Idempotent; the stream
-    /// re-anchors on the current phase whenever it is retargeted.
-    fn start_paced(&mut self) {
-        if let Some(p) = self.paced.as_ref() {
-            if p.running.load(Ordering::SeqCst) {
-                return;
-            }
-        }
-
-        let period_us = (1_000_000.0 / self.rate as f64).max(1.0) as u64;
-        // Clamp to the emitter's allowed packet period (7600-9000 us): a burst
-        // below 7600 us would be rejected by the RP2040's master-lock filter,
-        // and anything over 9000 stretches the idle timeout.
-        let period_us = period_us.clamp(7600, 9000);
-        let running = Arc::new(AtomicBool::new(true));
-        let phase_us = Arc::new(AtomicI64::new(self.swap_phase_us as i64));
-
-        // The context is only touched from this thread while it exists (it is
-        // stopped before the context is dropped), mirroring the unsynchronized
-        // sharing of the stereo thread and the original C.
-        struct SendPtr(*mut NvstusbContext);
-        unsafe impl Send for SendPtr {}
-        impl SendPtr {
-            fn get(&self) -> *mut NvstusbContext {
-                self.0
-            }
-        }
-        let ctx_ptr = SendPtr(self as *mut NvstusbContext);
-
-        let run = running.clone();
-        let ph = phase_us.clone();
-        let pr = self.present.clone();
-        // The native-Wayland presentation-time anchor, if installed. Highest
-        // priority: it is phase-locked to *our surface's* present, which is the
-        // only clock that correlates with the composited frame boundary.
-        let wl = self.wayland_present.clone();
-
-        // Preferred anchor: the kernel's real display vblank clock
-        // (DRM_IOCTL_WAIT_VBLANK on the active CRTC).  This is the ONLY clock
-        // phase-locked to the physical image alternation on the screen.  On
-        // composited desktops the swap return / present instant is decoupled
-        // from the vblank, so anchoring the packets there (as before) made the
-        // `,`/`.` phase sweep land at arbitrary points of the frame - which is
-        // why no phase ever separated the two views.  With the vblank anchor
-        // the sweep is deterministic against the actual image switch.
-        let drm = DrmVblank::open();
-        if drm.is_some() {
-            eprintln!("nvstusb: paced stream anchored to DRM vblank");
-        }
-
-        // Anchor 1.5: sync-control MSC/UST read off the app's own GLX/EGL
-        // context (captured here on the main thread while winit's context is
-        // current), tracking the CRTC vblank clock without any /dev/dri access.
-        // Created here rather than on the paced thread: capture() reads the
-        // *current* context's display/drawable, which only exists on this
-        // thread during init.
-        let mut oml = if drm.is_none() {
-            let msc = x11glx::MscAnchor::capture();
-            if msc.is_some() {
-                eprintln!("nvstusb: paced stream anchored to OML sync control");
-            }
-            msc
-        } else {
-            None
+    /// Blocks until the next vblank boundary passes (SGI video sync in the
+    /// app's own GLX context).  Returns the boundary instant; also refreshes
+    /// the smoothed period estimate.  Used only to seed pacing before the
+    /// first confirmed present.
+    fn wait_vblank_boundary(&mut self) -> Instant {
+        let (get, wait) = match (
+            self.glx.get_video_sync_sgi,
+            self.glx.wait_video_sync_sgi,
+        ) {
+            (Some(g), Some(w)) => (g, w),
+            _ => return Instant::now(),
         };
 
-        let thread = thread::spawn(move || {
-            let ctx = unsafe { &mut *ctx_ptr.get() };
-            let mut drm = drm;
-            let period = Duration::from_micros(period_us);
-            let mut phase = ph.load(Ordering::Relaxed).max(0) as u64;
-            let mut next = Instant::now() + Duration::from_micros(phase);
-            let mut eye = Eye::Left;
-            // Wayland presentation anchor: last generation consumed, so a new
-            // present is waited on every iteration rather than re-reporting the
-            // same one in a busy spin.
-            let mut wl_gen: u64 = 0;
-            while run.load(Ordering::SeqCst) {
-                let now = Instant::now();
+        let mut count: u32 = 0;
+        unsafe { get(&mut count) };
+        // One-counter-tick wait via the parity idiom: block until the
+        // counter's parity flips to the opposite of the value just read.
+        let rem = (count.wrapping_add(1)) & 1;
+        unsafe { wait(2, rem as i32, &mut count) };
+        let now = Instant::now();
 
-                // Anchor 1 (preferred on composited desktops): the surface's
-                // own `wp_presentation_feedback`.  `wait_next` blocks until the
-                // render loop's present is confirmed by the compositor, so we
-                // send the packet for the *next* boundary after that present,
-                // at `present + period + phase`, and the IR (packet + 3000 us
-                // alarm delay) fires exactly at that boundary.  This is the
-                // only anchor phase-locked to *our surface's* frame switch on
-                // a Wayland desktop; a `None` return means the frame was
-                // discarded, so fall through to the DRM/OML/present anchors.
-                if let Some(w) = wl.as_ref() {
-                    if let Some(b) = w.wait_next(&mut wl_gen) {
-                        let p_us = w.period_us().max(7600);
-                        let mut target =
-                            b + Duration::from_micros(p_us) + Duration::from_micros(phase)
-                                - Duration::from_micros(IR_ALARM_DELAY_US);
-                        while target <= Instant::now() {
-                            target += Duration::from_micros(p_us);
-                        }
-                        let remain = target.saturating_duration_since(Instant::now());
-                        if remain.as_micros() > 2000 {
-                            thread::sleep(remain - Duration::from_millis(1));
-                        }
-                        spin_until(target);
-                        ctx.set_eye(eye);
-                        eye = match eye {
-                            Eye::Left => Eye::Right,
-                            _ => Eye::Left,
-                        };
-                        let new_phase = ph.load(Ordering::Relaxed).max(0) as u64;
-                        if new_phase != phase {
-                            phase = new_phase;
-                        }
-                        continue;
-                    }
-                    eprintln!("nvstusb: wayland frame discarded; using DRM anchor");
-                }
-
-                // Anchor 2 (preferred on KMS): the real display boundary.  Block for
-                // the vblank that just occurred, then send the packet for the
-                // *next* boundary so the IR (packet + 3000 us alarm delay)
-                // fires at `next_boundary + phase`.  `phase` therefore sweeps
-                // the shutter switch deterministically across the image switch
-                // with the `,`/`.` keys.  Consecutive packets stay ~one period
-                // apart because we re-anchor off a fresh kernel vblank every
-                // iteration.
-                if let Some(d) = drm.as_mut() {
-                    if let Some(b) = d.wait_vblank() {
-                        let p_us = d.period_us().max(7600);
-                        let mut target = d.instant_of(b)
-                            + Duration::from_micros(p_us)
-                            + Duration::from_micros(phase)
-                            - Duration::from_micros(IR_ALARM_DELAY_US);
-                        while target <= Instant::now() {
-                            target += Duration::from_micros(p_us);
-                        }
-                        let remain = target.saturating_duration_since(Instant::now());
-                        if remain.as_micros() > 2000 {
-                            thread::sleep(remain - Duration::from_millis(1));
-                        }
-                        spin_until(target);
-                        ctx.set_eye(eye);
-                        eye = match eye {
-                            Eye::Left => Eye::Right,
-                            _ => Eye::Left,
-                        };
-                        let new_phase = ph.load(Ordering::Relaxed).max(0) as u64;
-                        if new_phase != phase {
-                            phase = new_phase;
-                        }
-                        continue;
-                    }
-                    drm = None;
-                    eprintln!("nvstusb: DRM vblank pacing failed; using OML sync anchor");
-                }
-
-                // Anchor 1.5: OML sync control read off the app's own GLX/EGL
-                // context (captured at startup), used when no /dev/dri vblank
-                // clock is available.  Same schedule as Anchor 1, timed off
-                // the CRTC master counter.
-                if let Some(m) = oml.as_mut() {
-                    if let Some(b) = m.wait_vblank() {
-                        let p_us = m.period_us().max(7600);
-                        let mut target =
-                            b + Duration::from_micros(p_us) + Duration::from_micros(phase)
-                                - Duration::from_micros(IR_ALARM_DELAY_US);
-                        while target <= Instant::now() {
-                            target += Duration::from_micros(p_us);
-                        }
-                        let remain = target.saturating_duration_since(Instant::now());
-                        if remain.as_micros() > 2000 {
-                            thread::sleep(remain - Duration::from_millis(1));
-                        }
-                        spin_until(target);
-                        ctx.set_eye(eye);
-                        eye = match eye {
-                            Eye::Left => Eye::Right,
-                            _ => Eye::Left,
-                        };
-                        let new_phase = ph.load(Ordering::Relaxed).max(0) as u64;
-                        if new_phase != phase {
-                            phase = new_phase;
-                        }
-                        continue;
-                    }
-                    oml = None;
-                    eprintln!("nvstusb: OML sync pacing failed; using present anchor");
-                }
-
-                // Anchor 2 (fallback): lock to the render loop's present clock
-                // when it is fresh (the last present happened within the last
-                // two periods).  The anchor's PLL tracks the *mean* present
-                // phase and predicts the next present, so the packet schedule
-                // doesn't chase every swap-return outlier (which previously
-                // smeared the `,`/`.` null band into alternating flicker).
-                // `phase` sweeps deterministically against the smoothed
-                // present grid.  When no present is known (startup, render
-                // stalled) fall back to the previous schedule so the RP2040
-                // master lock is held.
-                let target = if let Some(lp) = pr.last() {
-                    if now.duration_since(lp) <= Duration::from_micros(2 * period_us) {
-                        let mut t = pr.next().unwrap_or(lp + period) + Duration::from_micros(phase);
-                        while t <= now {
-                            t += period;
-                        }
-                        t
-                    } else {
-                        if next <= now {
-                            next = now + period;
-                        }
-                        next
-                    }
-                } else {
-                    if next <= now {
-                        next = now + period;
-                    }
-                    next
-                };
-
-                // Sleep most of the wait, spin only the tail: keeps the packet
-                // deadline exact (thread::sleep overshoots by hundreds of us)
-                // without pegging a CPU core for the whole frame period.
-                let remain = target.saturating_duration_since(Instant::now());
-                if remain.as_micros() > 2000 {
-                    thread::sleep(remain - Duration::from_millis(1));
-                }
-                spin_until(target);
-                ctx.set_eye(eye);
-                eye = match eye {
-                    Eye::Left => Eye::Right,
-                    _ => Eye::Left,
-                };
-
-                // Live phase retarget (','/'.' keys): recompute the next target
-                // from the (new) phase on the next iteration immediately.
-                let new_phase = ph.load(Ordering::Relaxed).max(0) as u64;
-                if new_phase != phase {
-                    phase = new_phase;
-                    continue;
-                }
-                next = target + period;
+        if let Some(last) = self.present_instant {
+            let dt = now.duration_since(last).as_micros() as u64;
+            if (7600..=9000).contains(&dt) {
+                self.vsync_period_us = (self.vsync_period_us * 3 + dt) / 4;
             }
-        });
-        self.paced = Some(PacedStream {
-            running,
-            phase_us,
-            thread: Some(thread),
-        });
+        }
+        now
     }
 
-    /// Stops the paced eye-packet stream (method 5) and waits for it to exit.
-    fn stop_paced(&mut self) {
-        if let Some(p) = self.paced.take() {
-            p.running.store(false, Ordering::SeqCst);
-            if let Some(thread) = p.thread {
-                let _ = thread.join();
+    /// Reads the OML swap-block counter for the app's drawable, if armed.
+    fn read_sbc(&self) -> Option<i64> {
+        let get = self.glx.get_sync_values_oml?;
+        let (mut ust, mut msc, mut sbc) = (0i64, 0i64, 0i64);
+        // GLX returns False without a current GLX context (e.g. native
+        // Wayland, where these symbols resolve but are meaningless) - the
+        // counters stay untouched, so treat that as "no data".
+        let ok = unsafe {
+            get(self.x11_display as *mut _, self.x11_drawable, &mut ust, &mut msc, &mut sbc)
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(sbc)
+    }
+
+    /// Present-counter snapshot for method 1: the OML SBC on X11/GLX (only
+    /// moves when OUR buffer completes), or the hardware vblank MSC via the
+    /// shadow EGL surface on native Wayland (moves every boundary; used to
+    /// time packets against real vblanks since SGI video sync no-ops there).
+    fn read_present_counter(&self) -> Option<i64> {
+        if let Some(egl) = self.egl_clock.as_ref() {
+            let (mut ust, mut msc, mut sbc) = (0i64, 0i64, 0i64);
+            unsafe {
+                if (egl.get_sync_values)(egl.dpy, egl.surf, &mut ust, &mut msc, &mut sbc)
+                    == 0
+                {
+                    return None;
+                }
             }
+            return Some(msc);
+        }
+        self.read_sbc()
+    }
+
+    /// Waits (bounded to ~2 periods) until the present counter shows the
+    /// previous frame's swap completed, then records that instant as the
+    /// pacing anchor.  On X11 this is exact buffer attribution via SBC; on
+    /// Wayland it is the first vblank boundary after the swap call, which
+    /// tracks the compositor's cadence closely enough to phase-lock against
+    /// instead of the noisy swap-return instant.
+    fn confirm_last_present(&mut self) {
+        if !self.pending_confirm {
+            return;
+        }
+        self.pending_confirm = false;
+
+        let deadline = Instant::now() + Duration::from_micros(2 * self.vsync_period_us);
+        loop {
+            match self.read_present_counter() {
+                Some(sbc) if sbc > self.pre_swap_sbc => {
+                    let now = Instant::now();
+                    if let Some(last) = self.present_instant {
+                        let dt = now.duration_since(last).as_micros() as u64;
+                        if (7600..=9000).contains(&dt) {
+                            self.vsync_period_us = (self.vsync_period_us * 3 + dt) / 4;
+                        }
+                    }
+                    self.present_instant = Some(now);
+                    return;
+                }
+                None => return, // OML unavailable: legacy pacing.
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                // Present not observed in time (heavy compositor backlog).
+                // Keep the old anchor; prediction re-syncs on the next hit.
+                eprintln!("nvstusb: present confirmation timed out");
+                return;
+            }
+            precise_sleep(300);
         }
     }
 
@@ -1225,7 +1196,95 @@ impl NvstusbContext {
 
 impl Drop for NvstusbContext {
     fn drop(&mut self) {
-        self.stop_paced();
         self.stop_stereo_thread();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wayland/EGL present clock (runtime-loaded, no build-time EGL dependency)
+// ---------------------------------------------------------------------------
+
+/// EGL config attribute constants used below.
+const EGL_SURFACE_TYPE: i32 = 0x3033;
+const EGL_WINDOW_BIT: i32 = 0x0004;
+const EGL_RED_SIZE: i32 = 0x3024;
+const EGL_GREEN_SIZE: i32 = 0x3023;
+const EGL_BLUE_SIZE: i32 = 0x3022;
+const EGL_NONE: i32 = 0x3038;
+
+/// Builds an [`EglClock`] over the app's Wayland display + surface.
+///
+/// `eglGetDisplay` is specified to return the same `EGLDisplay` singleton for
+/// the same native display, so this joins the app's own EGL instance rather
+/// than creating a parallel one.  The shadow surface is created only so the
+/// sync-value query has a target; it never receives buffers.
+///
+/// # Safety
+/// `wl_display`/`wl_surface` must be valid for the lifetime of the returned
+/// clock (they are the app's own objects, which outlive it).
+unsafe fn egl_clock_new(wl_display: usize, wl_surface: usize) -> Result<EglClock, String> {
+    use libloading::{Library, Symbol};
+
+    let lib = Library::new("libEGL.so.1")
+        .or_else(|_| Library::new("libEGL.so"))
+        .map_err(|e| format!("dlopen libEGL: {e}"))?;
+    // Leaked on purpose: the entry points must outlive the context.
+    let lib: &'static Library = Box::leak(Box::new(lib));
+
+    unsafe {
+        let get_display: Symbol<unsafe extern "C" fn(usize) -> usize> =
+            lib.get(b"eglGetDisplay").map_err(|e| e.to_string())?;
+        let initialize: Symbol<unsafe extern "C" fn(usize, *mut i32, *mut i32) -> u32> =
+            lib.get(b"eglInitialize").map_err(|e| e.to_string())?;
+        let choose_config: Symbol<
+            unsafe extern "C" fn(usize, *const i32, *mut usize, i32, *mut i32) -> u32,
+        > = lib.get(b"eglChooseConfig").map_err(|e| e.to_string())?;
+        let create_window_surface: Symbol<
+            unsafe extern "C" fn(usize, usize, usize, *const i32) -> usize,
+        > = lib.get(b"eglCreateWindowSurface").map_err(|e| e.to_string())?;
+        let get_sync_values: Symbol<
+            unsafe extern "C" fn(usize, usize, *mut i64, *mut i64, *mut i64) -> u32,
+        > = lib
+            .get(b"eglGetSyncValuesCHROMIUM")
+            .map_err(|_| "eglGetSyncValuesCHROMIUM not exposed by this driver".to_string())?;
+
+        let dpy = get_display(wl_display);
+        if dpy == 0 {
+            return Err("eglGetDisplay failed".into());
+        }
+        let (mut major, mut minor) = (0i32, 0i32);
+        if initialize(dpy, &mut major, &mut minor) == 0 {
+            return Err("eglInitialize failed".into());
+        }
+
+        let attribs = [
+            EGL_SURFACE_TYPE,
+            EGL_WINDOW_BIT,
+            EGL_RED_SIZE,
+            8,
+            EGL_GREEN_SIZE,
+            8,
+            EGL_BLUE_SIZE,
+            8,
+            EGL_NONE,
+        ];
+        let mut config = 0usize;
+        let mut num_config = 0i32;
+        if choose_config(dpy, attribs.as_ptr(), &mut config, 1, &mut num_config) == 0
+            || num_config < 1
+        {
+            return Err("eglChooseConfig found no window config".into());
+        }
+
+        let surf = create_window_surface(dpy, config, wl_surface, std::ptr::null());
+        if surf == 0 {
+            return Err("eglCreateWindowSurface failed".into());
+        }
+
+        Ok(EglClock {
+            dpy,
+            surf,
+            get_sync_values: *get_sync_values,
+        })
     }
 }

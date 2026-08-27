@@ -198,7 +198,7 @@ use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval
 use glutin_winit::{ApiPreference, DisplayBuilder};
 use nvstusb::kms::KmsDisplay;
 use nvstusb::Eye;
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::ffi::{c_int, c_void};
 use std::num::NonZeroU32;
 use std::time::Instant;
@@ -302,6 +302,10 @@ struct App {
     perf_due: bool,
     /// Absolute start time, for mid-run timing reports.
     app_start: Instant,
+    /// Name of the wl_output the window was last seen on (Wayland); polled
+    /// periodically so moving the window re-targets the emitter's vblank
+    /// anchor to the new head.
+    last_monitor_name: Option<String>,
 }
 
 /// Cumulative frame-period statistics (never reset): mean rate, mean period,
@@ -376,12 +380,14 @@ impl FrameStats {
         gw: i32,
         gh: i32,
         phase_us: u32,
+        anchor: &str,
         write_stats: (u64, u64, u64, u64),
         wait_stats: (u64, u64, u64),
         swap_stats: &FrameStats,
         drm_present: (u64, i64, i64),
         drm_resync: (u64, i64, i64),
         kms_inverted: bool,
+        kms_stages: Option<String>,
     ) {
         let Some(start) = self.window_start else { return };
         let elapsed = start.elapsed();
@@ -435,7 +441,7 @@ impl FrameStats {
             self.count, secs, fps, avg_us, self.min_us, self.max_us, jitter_us, expected_us, vsync
         );
         eprintln!(
-            "[perf]   vblank wait avg={:.0}us max={}us | swap write avg={:.0}us max={}us slow={} | window {}x{} @ {:.2} Hz | phase {}us",
+            "[perf]   vblank wait avg={:.0}us max={}us | swap write avg={:.0}us max={}us slow={} | window {}x{} @ {:.2} Hz | phase {}us | anchor {}",
             g_avg,
             wait_stats.2,
             w_avg,
@@ -444,7 +450,8 @@ impl FrameStats {
             gw,
             gh,
             refresh,
-            phase_us
+            phase_us,
+            anchor,
         );
         if swap_stats.count > 0 {
             eprintln!(
@@ -469,6 +476,13 @@ impl FrameStats {
                 p_avg, drm_present.2, drm_resync.0, r_avg, drm_resync.2,
                 if kms_inverted { "ON (flip lands 1 vblank late)" } else { "OFF (flip lands on prediction)" }
             );
+        }
+        // KMS present pipeline breakdown (swap / lock / flipq / flipwait).
+        // The stage that absorbs the frame budget names the culprit: swap =
+        // GL flush + driver throttle, flipwait = flip latency, a large lock
+        // = buffer starvation, egl-err-after-swap = rejected GPU pushes.
+        if let Some(stages) = kms_stages {
+            eprintln!("[perf]   present stages: {stages}");
         }
 
         self.count = 0;
@@ -507,6 +521,7 @@ impl Default for App {
             frame_accum: FrameAccum::default(),
             perf_due: false,
             app_start: Instant::now(),
+            last_monitor_name: None,
         }
     }
 }
@@ -519,6 +534,37 @@ impl App {
         let Some(gl) = self.gl.as_ref() else {
             return;
         };
+
+        // Periodically re-check which wl_output the window is on so the
+        // emitter's kernel vblank anchor follows it across monitors (a
+        // windowed window can be dragged; a fullscreen one can be moved with
+        // compositor keybinds). Cheap: two winit lookups, no syscalls.
+        if self.frame_accum.count % 120 == 0 {
+            if let Some(w) = self.window.as_ref() {
+                let mon = w.current_monitor();
+                let name = mon.as_ref().and_then(|m| m.name());
+                let mhz = mon.as_ref().and_then(|m| m.refresh_rate_millihertz());
+                if name != self.last_monitor_name {
+                    eprintln!(
+                        "[monitor] window output {:?} -> {:?}",
+                        self.last_monitor_name, name
+                    );
+                    self.last_monitor_name = name.clone();
+                    if let Some(ctx) = self.nv_ctx.as_mut() {
+                        ctx.set_target_connector(name.as_deref());
+                        // Follow the new output's mode rate as well, so the
+                        // emitter matches what is actually on screen in
+                        // mixed-refresh multi-monitor setups. Only with a
+                        // plausible wl_output-reported rate: never fall back
+                        // to the XWayland global rate here, it may belong to
+                        // the OTHER monitor.
+                        if let Some(mhz) = mhz.filter(|v| *v >= 60_000) {
+                            stereo_helper::config_refresh_rate(ctx, Some(mhz));
+                        }
+                    }
+                }
+            }
+        }
 
         // Which eye are we on? (1/0 for left/right)
         self.current_eye = (self.current_eye + 1) % 2;
@@ -574,6 +620,9 @@ impl App {
         // so the swap closure captures disjoint field borrows directly.
         // Returns the KMS backend's flip hardware timestamp when available
         // (see `nvstusb::swap`); other backends have none to give.
+        // (Snapshot before the closure's mutable borrow of self.kms starts;
+        // the stage stats themselves are statics, no instance needed.)
+        let kms_active = self.kms.is_some();
         let mut swap_fn: Box<dyn FnMut() -> Option<u64> + '_> = match (
             self.gl_surface.as_ref(),
             self.gl_context.as_ref(),
@@ -613,13 +662,6 @@ impl App {
             self.swap_stats.observe(us);
         }
         self.last_swap_ret = Some(swap_ret);
-
-        // Feed the paced stream (vblank method 5) its frame-present anchor so
-        // its packet phase is measured against the real on-screen frame
-        // boundaries (see nvstusb::PresentAnchor).
-        if let Some(nv_ctx) = self.nv_ctx.as_mut() {
-            nv_ctx.notify_present();
-        }
 
         // Get the status of the button/wheel on the emitter (you MUST do this,
         // otherwise the whole system will stall out after just a couple of
@@ -670,12 +712,22 @@ impl App {
                     self.gw,
                     self.gh,
                     self.swap_phase_us,
+                    self.nv_ctx
+                        .as_ref()
+                        .map(|c| c.anchor_name())
+                        .unwrap_or_else(|| "none".to_string())
+                        .as_str(),
                     write,
                     wait,
                     &self.swap_stats,
                     drm_present,
                     drm_resync,
                     kms_inverted,
+                    if kms_active {
+                        KmsDisplay::take_present_stats_line()
+                    } else {
+                        None
+                    },
                 );
                 self.swap_stats = FrameStats::default();
                 // These are cumulative atomics/fields, not tied to
@@ -753,6 +805,18 @@ impl App {
                         } else {
                             "OFF"
                         }
+                    );
+                }
+            }
+            'o' | 'O' => {
+                // Multi-monitor fallback for drivers that hide connector
+                // names from plain clients (nvidia-drm): cycle which CRTC
+                // pipe the vblank anchor binds to until the blue/red scene
+                // separates cleanly. Wraps back to auto after pipe7.
+                if let Some(ctx) = self.nv_ctx.as_mut() {
+                    ctx.cycle_anchor_pipe();
+                    println!(
+                        "Cycled sync anchor pipe (watch the blue/red scene; auto after pipe7)."
                     );
                 }
             }
@@ -861,6 +925,56 @@ fn draw(
     }
 }
 
+/// Names the winit display-handle backend variant (diagnostics).
+fn dpy_kind(h: Option<&raw_window_handle::RawDisplayHandle>) -> &'static str {
+    use raw_window_handle::RawDisplayHandle as D;
+    match h {
+        Some(D::Xlib(_)) => "Xlib",
+        Some(D::Xcb(_)) => "Xcb",
+        Some(D::Wayland(_)) => "Wayland",
+        Some(_) => "other",
+        None => "unavailable",
+    }
+}
+
+/// Names the winit window-handle backend variant (diagnostics).
+fn win_kind(h: Option<&raw_window_handle::RawWindowHandle>) -> &'static str {
+    use raw_window_handle::RawWindowHandle as W;
+    match h {
+        Some(W::Xlib(_)) => "Xlib",
+        Some(W::Xcb(_)) => "Xcb",
+        Some(W::Wayland(_)) => "Wayland",
+        Some(_) => "other",
+        None => "unavailable",
+    }
+}
+
+/// Opens a private Xlib display on `$DISPLAY` via dlopen, for OML sync-value
+/// queries when winit only exposes an XCB connection.  The handle is
+/// intentionally leaked: it must outlive every query and lives for the
+/// process anyway.
+fn open_xlib_display() -> usize {
+    unsafe {
+        for name in ["libX11.so.6", "libX11.so"] {
+            if let Ok(lib) = libloading::Library::new(name) {
+                let f: libloading::Symbol<
+                    unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_void,
+                > = match lib.get(b"XOpenDisplay") {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let dpy = f(std::ptr::null());
+                if !dpy.is_null() {
+                    std::mem::forget(lib);
+                    eprintln!("nvstusb: opened private Xlib display via {name}");
+                    return dpy as usize;
+                }
+            }
+        }
+    }
+    0
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -870,13 +984,12 @@ impl ApplicationHandler for App {
         // Initialize communications with the usb emitter. `--no-emitter` skips
         // this so the scene can be tested without the IR emitter attached.
         //
-        // NOTE: the emitter is NOT configured here (rate/phase/paced stream).
-        // It is moved into `self.nv_ctx` below and only then configured, so the
-        // paced-fallback thread (vblank method 5, started by set_rate) gets a
-        // raw pointer to a context at a stable address for the rest of the
-        // process lifetime.  Configuring it while it still lives in this
-        // function's stack frame and then moving it into `self` left the paced
-        // thread pointing at freed stack memory -> SIGSEGV a moment after init.
+        // NOTE: the emitter is NOT configured here (rate/phase). It is moved
+        // into `self.nv_ctx` below and only then configured, so any context
+        // state gets a stable address for the rest of the process lifetime.
+        // Configuring it while it still lives in this function's stack frame
+        // and then moving it into `self` left pointers into freed stack
+        // memory -> SIGSEGV a moment after init.
         let nv_ctx = if self.no_emitter {
             eprintln!("Skipping USB emitter init (--no-emitter).");
             None
@@ -942,6 +1055,24 @@ impl ApplicationHandler for App {
         eprintln!(
             "[init] window inner size: {}x{} physical px",
             inner.width, inner.height
+        );
+
+        // Which output (monitor) is this window on? On Wayland this follows
+        // wl_surface.enter/leave, so for a fullscreen window it names the
+        // display that scans us out. The name matches the kernel DRM
+        // connector name (e.g. DP-1), which is what binds the emitter's
+        // vblank anchor to the RIGHT head: with two monitors on one GPU each
+        // CRTC free-runs at its own phase, and syncing to the wrong one
+        // shifts the shutter flip into mid-scanout - seen through the
+        // glasses as a top/bottom red/blue gradient instead of clean
+        // per-eye colours.
+        let monitor = window.current_monitor();
+        let monitor_name = monitor.as_ref().and_then(|m| m.name());
+        let monitor_mhz = monitor.as_ref().and_then(|m| m.refresh_rate_millihertz());
+        eprintln!(
+            "[init] window output: {:?} @ {:?} mHz",
+            monitor_name,
+            monitor_mhz.map(|m| m as f64 / 1000.0)
         );
 
         let display = gl_config.display();
@@ -1029,11 +1160,77 @@ impl ApplicationHandler for App {
         self.gw = inner.width as i32;
         self.gh = inner.height as i32;
 
-        // Auto-config the vsync rate.  Runs now that the context lives at a
-        // stable address in `self` (see the note at the top of `resumed`);
-        // `config_refresh_rate` may spawn the paced-fallback thread (method 5).
+        // Arm OML present feedback (vblank method 1) with the real Xlib
+        // display + drawable backing the GL surface, so eye packets follow
+        // actual on-screen presents - required on a composited desktop,
+        // where the compositor can delay or repeat a frame.
+        //
+        // Window XIDs are identical between Xlib and XCB, so any window
+        // handle variant works; only the display pointer must be an Xlib
+        // `Display*`.  If winit hands us an XCB connection instead, we open
+        // our own Xlib display on $DISPLAY - sync-value queries are
+        // server-side and work from a second connection.
         if let Some(ctx) = self.nv_ctx.as_mut() {
-            stereo_helper::config_refresh_rate(ctx);
+            let win = self.window.as_ref().unwrap();
+            let dpy_raw = win.display_handle().map(|h| h.as_raw());
+            let win_raw = win.window_handle().map(|h| h.as_raw());
+            eprintln!(
+                "nvstusb: winit handles: display={} window={}",
+                dpy_kind(dpy_raw.as_ref().ok()),
+                win_kind(win_raw.as_ref().ok()),
+            );
+
+            // Native Wayland: arm the EGL present clock over the app's own
+            // wl_display/wl_surface instead.
+            match (&dpy_raw, &win_raw) {
+                (
+                    Ok(raw_window_handle::RawDisplayHandle::Wayland(d)),
+                    Ok(raw_window_handle::RawWindowHandle::Wayland(w)),
+                ) => {
+                    ctx.set_wayland_target(
+                        d.display.as_ptr() as usize,
+                        w.surface.as_ptr() as usize,
+                    );
+                }
+                _ => {
+                    let mut xlib_dpy = match dpy_raw {
+                        Ok(raw_window_handle::RawDisplayHandle::Xlib(d)) => {
+                            d.display.map(|p| p.as_ptr() as usize).unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    let drawable = match win_raw {
+                        Ok(raw_window_handle::RawWindowHandle::Xlib(w)) => w.window as u64,
+                        Ok(raw_window_handle::RawWindowHandle::Xcb(w)) => {
+                            u64::from(w.window.get())
+                        }
+                        _ => 0,
+                    };
+
+                    if xlib_dpy == 0 && drawable != 0 {
+                        xlib_dpy = open_xlib_display();
+                    }
+
+                    if xlib_dpy != 0 && drawable != 0 {
+                        ctx.set_x11_target(xlib_dpy, drawable);
+                    } else {
+                        eprintln!(
+                            "nvstusb: present feedback disabled (dpy={:#x} drawable={:#x})",
+                            xlib_dpy, drawable
+                        );
+                    }
+                }
+            }
+        }
+
+        // Auto-config the vsync rate.  Runs now that the context lives at a
+        // stable address in `self` (see the note at the top of `resumed`).
+        if let Some(ctx) = self.nv_ctx.as_mut() {
+            // Bind the kernel vblank anchor to the output showing this window
+            // (multi-monitor GPUs: wrong head == de-phased shutters), and use
+            // that monitor's own mode rate for the emitter.
+            ctx.set_target_connector(monitor_name.as_deref());
+            stereo_helper::config_refresh_rate(ctx, monitor_mhz);
 
             // Optional initial shutter delay (us), e.g. NVSTUSB_DELAY_US=5000.
             if let Some(raw) = std::env::var_os("NVSTUSB_DELAY_US") {
@@ -1215,9 +1412,11 @@ fn run_kms(no_emitter: bool) -> Result<(), String> {
     // behavior instead of always assuming the driver rejected it (see
     // nvstusb::swap, method 4). Ghosting on both eyes is the classic symptom
     // of getting this backwards - the wrong eye's shutter fires every frame.
-    // Note: on the GBM platform eglSwapInterval(0) fails unconditionally, so
-    // this is only a provisional guess; the measured present error re-decides
-    // within a second or two of steady frames (see
+    // The readback is authoritative now: the interval request moved into
+    // `make_current`, where a current context makes it valid (calling it
+    // pre-context made Mesa reject ANY value with EGL_BAD_PARAMETER, which
+    // we misread as "GBM always throttles"). The measured present error
+    // still re-decides within a second or two of steady frames (see
     // nvstusb::NvstusbContext::update_kms_inversion).
     nv_ctx.set_kms_vsync_throttled(kms.vsync_throttled());
     eprintln!(
@@ -1307,6 +1506,7 @@ fn run_kms(no_emitter: bool) -> Result<(), String> {
         frame_accum: FrameAccum::default(),
         perf_due: false,
         app_start: Instant::now(),
+        last_monitor_name: None,
     };
     if let Some(ctx) = app.nv_ctx.as_ref() {
         app.swap_phase_us = ctx.swap_phase_us();

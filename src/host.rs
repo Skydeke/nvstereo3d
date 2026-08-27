@@ -4,43 +4,57 @@
 //! eye-swap command per presented frame into a shared-memory ring
 //! (`/tmp/nvstusb.shm`, exposed to Wine as `Z:\tmp\nvstusb.shm`) and sends a
 //! non-blocking one-byte UDP datagram to wake us.  This helper owns the USB
-//! emitter, consumes the ring, and fires the shutter eye packet in step with
-//! the game's presents.
+//! emitter and fires the shutter packet in step with the display.
 //!
-//! The USB layer is ported verbatim from the confirmed-working `3dv3d`
-//! project (see `usb.rs`).
+//! ## Why the eye comes from a strict alternator, not from the ring
 //!
-//! Unlike the naive helper (which fired on the game's presents and so wobbled
-//! at the present cadence, not the display's), this build anchors each eye
-//! packet to the display engine's REAL vblank clock via `DRM_IOCTL_WAIT_VBLANK`
-//! (see `drm.rs`, ported from 3dv3d).  *When* each packet fires is fixed to
-//! the hardware 120Hz grid — the same mechanism that makes 3dv3d shutter
-//! correctly even under a Hyprland compositor.
+//! Earlier builds popped each fired eye straight off the ring ("FIFO
+//! content-follow"): the Nth queued swap was fired into the Nth vblank slot.
+//! That scheme assumes the helper can know WHICH display slot each queued
+//! swap's frame scans out in.  It cannot:
 //!
-//! *Which* eye fires is taken directly from the DLL's swap stream: each
-//! `EnqueueSwap` is a FIFO entry, popped in order, one per vblank fire (see
-//! `pending_eyes` in `run()`). Earlier builds instead ran a free-running L/R
-//! alternator and only used the DLL's reports to detect, after the fact, that
-//! the alternator's assumed polarity had drifted from the game's actual
-//! output (`drift`/`DRIFT_WINDOW`) — real desyncs (a dropped or doubled
-//! Present under Wine/Proton) went uncorrected for up to `DRIFT_WINDOW`
-//! frames, and the "correction" was itself a one-frame same-eye hitch. FIFO
-//! consumption has no such lag: the fired eye always matches whatever the
-//! game actually reported for that slot, as long as it arrives before the
-//! fire deadline. A slot with nothing queued (game stalled or a present was
-//! dropped) is a genuine underrun, not a phase to chase — see `underruns`.
+//! 1. The DLL's swap stream is a *synthetic* strict alternation.
+//!    `CBaseSwapChain::PresentData()` (SHUTTER_MODE_SIMPLE) calls
+//!    `Output(true); Present; Output(false); Present` unconditionally, so the
+//!    ring bytes are L,R,L,R,... by construction -- regardless of what the
+//!    compositor actually scanned out.  Order carries zero phase information.
+//! 2. With vsync-blocking presents (the normal case under Wine), a swap lands
+//!    in the ring only AFTER its frame has already flipped: Present returns
+//!    just past the boundary its frame appeared at.  Every fire deadline we
+//!    own (~3 ms BEFORE the next boundary) precedes the arrival of the eye
+//!    that belongs to it.  Popping the oldest queued swap therefore fires each
+//!    eye one slot late -- a persistent inversion -- and scheduler/compositor
+//!    jitter around the drain points makes correctness flicker between
+//!    correct and inverted: both frames visible in both eyes.
+//! 3. When presents do NOT block (SyncInterval=0 games, coalescing), swaps
+//!    arrive bursty or half-rate relative to the display and NO fixed
+//!    queue-to-slot offset exists at all.
 //!
-//! The FIFO is ideal while the game presents exactly one frame per vblank
-//! slot ("every frame is perfect").  Real Wine/Proton streams are not: a
-//! dropped or doubled Present shifts the frame-to-slot alignment, after which
-//! the Nth queued eye no longer matches the Nth fire and the FIFO would fire
-//! the wrong eye persistently.  A polarity tracker over the swap stream (same
-//! `drift`/`DRIFT_WINDOW` scheme as the earlier alternator build) detects that
-//! sustained inversion and falls back to the strict L/R alternator — with a
-//! single same-eye re-align pair — until the stream proves lock-step again,
-//! then returns to FIFO.
+//! Meanwhile the *timing* half of the problem is solved and proven (the 3dv3d
+//! demo shutters perfectly): anchor every packet to the display engine's real
+//! vblank clock via `DRM_IOCTL_WAIT_VBLANK` (see `drm.rs`), pre-firing each
+//! packet ~ALARM_DELAY_US before its target boundary.  The glasses lock when
+//! consecutive packets strictly alternate at a stable ~120 Hz period --
+//! exactly what a strict alternator on that grid produces, forever, with no
+//! dependence on the game's present behaviour.
+//!
+//! So this build fires the STRICT ALTERNATOR as the eye source and uses the
+//! DLL's stream for the one thing it reliably measures: HOW MANY presents
+//! happened.  Each dropped or doubled present shifts `(swaps seen - packets
+//! fired)` permanently; once such a step persists for REALIGN_HOLD_SWAPS
+//! swaps, we re-align the alternator with a single same-eye pair (one-frame
+//! hitch, like the old alternator build's correction).  A sustained rate
+//! mismatch (content not landing one-per-boundary) is NOT chased -- flipping
+//! polarity periodically would be worse than the disease -- it is latched and
+//! reported loudly instead, because that failure must be fixed upstream
+//! (force SyncInterval=1 / full-rate presents); no emitter-side trick can
+//! shutter content whose eyes don't alternate at the display rate.
+//!
+//! A constant +/-1 SLOT offset between the two streams stays invisible to
+//! every in-band check (both streams remain self-consistent under a whole-
+//! stream shift), so the emitter's 3D button toggles manual eye inversion --
+//! press it whenever depth perception says the eyes are swapped.
 
-use std::collections::VecDeque;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -48,7 +62,7 @@ use std::time::{Duration, Instant};
 use crate::nvstusb::drm;
 use crate::nvstusb::usb;
 use crate::shm;
-use crate::shm::{EYE_RIGHT, FLAG_EMITTER_PRESENT, FLAG_FIRMWARE_LOADED, Shm,
+use crate::shm::{FLAG_EMITTER_PRESENT, FLAG_FIRMWARE_LOADED, Shm,
                 STATUS_ERROR, STATUS_OPENING, STATUS_READY};
 
 /// Embedded firmware image (must match the one shipped with `3dv3d`).
@@ -81,8 +95,24 @@ const MASTER_LOCK_MAX_US: u64 = 9000;
 /// Fixed firmware packet -> IR alarm delay (see `drm.rs`), used to pre-fire
 /// each eye packet so the shutter opens exactly when the frame presents.
 const ALARM_DELAY_US: u64 = 3_000;
-/// Extra CPU/scheduling lead folded into the pre-fire busy-wait.
-const HOST_LEAD_US: u64 = 500;
+/// Default extra lead folded into the pre-fire busy-wait (see
+/// [`fire_lead_us`]).
+const DEFAULT_HOST_LEAD_US: u64 = 250;
+
+/// Pre-fire lead in microseconds (`NVSTUSB_HOST_LEAD_US` overrides).  The IR
+/// flip lands roughly this many microseconds before the target vblank
+/// timestamp minus the USB write time.  Too large and the shutter switches
+/// while the previous eye's frame is still scanning out: the tail of the old
+/// frame leaks into the new eye exactly like a mis-tuned phase in the demo
+/// (sweepable there with `,`/`.`).  The demo's working default corresponds to
+/// ~100 us before the boundary - just inside blanking; 250 leaves margin for
+/// USB write-time jitter.  Sweep this if games show edge ghosting that the
+/// demo does not.
+fn fire_lead_us() -> u64 {
+    env_or("NVSTUSB_HOST_LEAD_US", "250")
+        .parse()
+        .unwrap_or(DEFAULT_HOST_LEAD_US)
+}
 
 impl StreamStats {
     fn record(&mut self, right: bool) {
@@ -116,21 +146,24 @@ impl StreamStats {
         self.sum_period / self.period_n
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tick(
         &mut self,
         corrections: u64,
-        underruns: &mut u64,
-        dropped_stale: &mut u64,
+        swaps_this_window: &mut u64,
+        batches_ge2: &mut u64,
+        max_batch: &mut usize,
         lead_n: &mut u64,
         lead_sum: &mut u64,
         lead_min: &mut u64,
+        lead_max: &mut u64,
     ) {
         let now = std::time::Instant::now();
         let report = match self.last_report {
             None => true,
             Some(t) => now.duration_since(t).as_secs() >= 1,
         };
-        if !report || self.count == 0 {
+        if !report || (self.count == 0 && *swaps_this_window == 0) {
             return;
         }
         let avg = self.median_period_us();
@@ -138,29 +171,52 @@ impl StreamStats {
             && self.min_period >= MASTER_LOCK_MIN_US
             && self.max_period <= MASTER_LOCK_MAX_US
             && self.same_eye == 0;
-        let warn = if in_window {
-            "IN-LOCK-WINDOW"
+        // Content health: while we fire one packet per display slot, wiz3D
+        // must present (enqueue) at roughly the same rate. Anything far below
+        // that means the screen is not showing a fresh eye every slot, which
+        // no emitter timing can compensate.
+        let starved = self.count >= 60 && *swaps_this_window * 2 < self.count as u64;
+        let warn = if starved {
+            format!(
+                "*** SWAP STARVATION: {} swaps/s vs {} packets/s -- Nvidia3DOutput \
+                 is presenting far below display rate (game paused/menu? stereo \
+                 disengaged -> mono fallback? presents coalescing?). Glasses are \
+                 locked but content cannot follow ***",
+                *swaps_this_window, self.count
+            )
+        } else if in_window {
+            "IN-LOCK-WINDOW".to_string()
         } else {
-            "*** glasses will NOT lock ***"
+            "*** glasses will NOT lock ***".to_string()
         };
+        let mut extra = String::new();
+        if *batches_ge2 > 0 {
+            extra.push_str(&format!(
+                " | bursty-swaps {}x>=2 (max batch {})",
+                *batches_ge2, *max_batch
+            ));
+        }
         if self.period_n > 0 {
             let lead_avg = if *lead_n > 0 { *lead_sum / *lead_n } else { 0 };
             let lead_str = if *lead_n > 0 {
-                format!(" | swap-lead {}us (min {})", lead_avg, *lead_min)
+                format!(
+                    " | swap-lead {}us (min {}, max {})",
+                    lead_avg, *lead_min, *lead_max
+                )
             } else {
                 String::new()
             };
-            let stale_str = if *dropped_stale > 0 {
-                format!(" | dropped-stale {}", *dropped_stale)
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "nvstusb-host: {}/s packets | period {}-{}us (avg {}) | alternating {}/{} | underruns/s {} | phase-corrections {}{}{} | {warn}",
-                self.count, self.min_period, self.max_period, avg, self.alternating, self.count, underruns, corrections, stale_str, lead_str
-            );
+        // Content fps: SIMPLE mode enqueues two swaps per game frame.
+        let content_fps = *swaps_this_window / 2;
+        eprintln!(
+            "nvstusb-host: {}/s packets | {}/s swaps (content~{}fps) | period {}-{}us (avg {}) | alternating {}/{} | phase-corrections {}{extra}{lead_str} | {warn}",
+            self.count, swaps_this_window, content_fps, self.min_period, self.max_period, avg, self.alternating, self.count, corrections,
+        );
         } else {
-            eprintln!("nvstusb-host: {}/s packets (1 frame since start)", self.count);
+            eprintln!(
+                "nvstusb-host: 0 packets | {}/s swaps{extra} | {warn}",
+                swaps_this_window
+            );
         }
         self.count = 0;
         self.alternating = 0;
@@ -171,50 +227,23 @@ impl StreamStats {
         self.period_n = 0;
         self.last_dt = None;
         self.last_report = Some(now);
+        // Window-scoped counters live here so they accumulate a FULL second
+        // (resetting them per loop iteration would only ever count one slot).
+        *swaps_this_window = 0;
+        *batches_ge2 = 0;
+        *max_batch = 0;
         *lead_n = 0;
         *lead_sum = 0;
         *lead_min = 0;
-        *underruns = 0;
-        *dropped_stale = 0;
+        *lead_max = 0;
     }
 }
 
-/// Cap on how many un-fired swap reports we'll hold. Normal operation keeps
-/// this at 0-1 (one report drained per vblank fire); a deeper backlog means
-/// the DLL is bursty relative to our drain cadence (e.g. a brief host
-/// scheduling hiccup delayed a drain call) rather than a real desync, so this
-/// is sized generously -- dropping real backlog here manufactures underruns
-/// that didn't happen, which is worse than holding a slightly stale queue.
-const MAX_QUEUED_EYES: usize = 16;
-
-/// Backup polarity slip window: how many consecutively-inverted swap reports
-/// (in net) before we conclude the content-follow alignment has genuinely
-/// slipped (a dropped/hitched present) and re-align via the alternator.
-const DRIFT_WINDOW: i64 = 16;
-
-/// Backup underrun trigger: how many FIFO underruns (a fire slot where the
-/// game reported no swap) must accumulate before we stop content-following and
-/// switch to the strict alternator.  A repeated underrun makes the fired stream
-/// non-alternating (L,L,R,R), which breaks the glasses lock -- the one thing we
-/// must never do.  `ur_counter` only resets once the stream proves healthy
-/// (HEALTHY_RESET_FIRES clean pops), so a half-rate stream (60fps on a 120Hz
-/// display: underrun/clean alternating) still accumulates and triggers.
-const BACKUP_UR_TRIGGER: u64 = 8;
-/// Consecutive clean (non-underrun) FIFO pops that prove the game is feeding a
-/// proper one-frame-per-slot stream again, resetting the underrun counter.
-const HEALTHY_RESET_FIRES: u64 = 16;
-/// While the alternator backup is active, fires over which we judge whether the
-/// game has returned to full cadence (>= ~1 swap per fire slot).
-const BACKUP_RESUME_WINDOW: u64 = 16;
-/// Minimum swaps received over BACKUP_RESUME_WINDOW fires to treat the stream
-/// as full-rate 120Hz again (60fps yields ~half this).
-const BACKUP_RESUME_MIN_SWAPS: u64 = 14;
-
-/// Advances the strict alternator after emitting `*fire_eye`.  When a polarity
+/// Advances the strict alternator after emitting `fire_eye`.  When a polarity
 /// re-alignment is pending, we do NOT toggle so the next slot shares the same
-/// eye (a single same-eye pair); that shifts the alternation's base by one and
-/// re-aligns the shutter with the game's content without breaking the strict
-/// cadence past that one pair.
+/// eye (a single same-eye pair); that shifts the alternation's base by one
+/// and re-aligns the shutter with the game's content without breaking the
+/// strict cadence past that one pair.
 fn advance_eye(fire_eye: &mut bool, pending_flip: &mut bool) {
     if *pending_flip {
         *pending_flip = false;
@@ -223,76 +252,96 @@ fn advance_eye(fire_eye: &mut bool, pending_flip: &mut bool) {
     }
 }
 
-/// Chooses the eye to fire for one vblank slot and maintains the FIFO-vs-
-/// alternator backup state.
+/// Tracks the DLL's present stream against our fire count and decides when
+/// the alternator needs a one-pair re-alignment.
 ///
-/// FIFO (content-follow) is used while the game feeds a clean one-frame-per-
-/// slot stream: the eye is the game's actual report for the slot.  When it
-/// stops feeding (an underrun every other slot, e.g. 60fps content on a 120Hz
-/// display), repeating `last_fired_eye` keeps the content correct but makes the
-/// fired stream non-alternating (L,L,R,R) and the glasses fall out of lock.  A
-/// sustained run of underruns therefore hands the eye source over to the strict
-/// alternator (`fire_eye`), which always alternates so the lock holds, until
-/// the game returns to full cadence.
-fn pick_eye(
-    pending_eyes: &mut VecDeque<bool>,
-    last_fired_eye: &mut bool,
-    underruns: &mut u64,
-    ur_counter: &mut u64,
-    clean_run: &mut u64,
-    fire_eye: &mut bool,
-    pending_flip: &mut bool,
-    backup_active: &mut bool,
-    backup_swaps: &mut u64,
-    backup_fires: &mut u64,
-) -> bool {
-    if *backup_active {
-        // Alternator active: fire the strict alternation so the glasses keep
-        // their lock, and periodically check whether the game is back to full
-        // cadence (~1 swap per fire slot) -- if so, resume content-follow.
-        *backup_fires += 1;
-        if *backup_fires >= BACKUP_RESUME_WINDOW {
-            if *backup_swaps >= BACKUP_RESUME_MIN_SWAPS {
-                *backup_active = false;
-                pending_eyes.clear(); // rebuild a fresh, aligned queue
-            }
-            *backup_fires = 0;
-            *backup_swaps = 0;
-        }
-        let eye = *fire_eye;
-        advance_eye(fire_eye, pending_flip);
-        return eye;
-    }
+/// The only trustworthy invariant is the COUNT relationship: the DLL enqueues
+/// exactly one swap per Output() call, and wiz3D presents twice per game
+/// frame, so while everything is healthy `swaps_seen - fires_fired` is
+/// CONSTANT (a small nonzero value -- a swap is always observed shortly
+/// before its slot's fire).  A dropped or doubled present makes the delta
+/// STEP to a new value; once it has stopped moving for
+/// [`REALIGN_HOLD_SWAPS`] swaps the step is confirmed.  Only an ODD total
+/// step shifts eye parity (an even number of dropped/doubled presents leaves
+/// L/R alignment intact), so the alternator re-aligns with a single same-eye
+/// pair exactly then; every confirmed step becomes the new baseline either
+/// way.
+///
+/// Sustained RATE mismatches (presents trickling or bursting at other than
+/// display rate) keep the delta moving, so this tracker goes quiet there and
+/// the per-second telemetry reports the starvation instead -- flipping
+/// polarity periodically to chase a rate mismatch would be worse than the
+/// disease.
+struct SlipTracker {
+    /// Aligned value of `swaps_seen - fires_fired`.
+    baseline: i64,
+    /// Last delta value seen (to detect that it stopped moving).
+    prev_delta: i64,
+    /// `swaps_seen` at which the delta settled on `prev_delta`.
+    stable_since: Option<u64>,
+}
 
-    // FIFO (content-follow) active.
-    match pending_eyes.pop_front() {
-        Some(eye) => {
-            // A clean pop proves the game is feeding one frame per slot.
-            *clean_run += 1;
-            if *clean_run >= HEALTHY_RESET_FIRES {
-                *clean_run = 0;
-                *ur_counter = 0;
-            }
-            eye
+impl SlipTracker {
+    fn new() -> Self {
+        // `prev_delta = MIN` guarantees the very first sample takes the seed
+        // branch instead of being read as a step.
+        Self {
+            baseline: 0,
+            prev_delta: i64::MIN,
+            stable_since: None,
         }
-        None => {
-            // Underrun: the game didn't present a frame for this slot.
-            // Repeating last_fired_eye is content-correct but breaks strict
-            // alternation; a run of these loses the lock, so hand over to the
-            // alternator once the stream is proven broken.
-            *underruns += 1;
-            *ur_counter += 1;
-            *clean_run = 0;
-            if *ur_counter >= BACKUP_UR_TRIGGER {
-                *backup_active = true;
-                *backup_fires = 0;
-                *backup_swaps = 0;
-                pending_eyes.clear();
-                let eye = *fire_eye;
-                advance_eye(fire_eye, pending_flip);
-                return eye;
+    }
+}
+
+/// How many swaps a new delta must persist before we treat it as a confirmed
+/// slip. ~200 ms at 120 Hz: long enough to ride out one missed drain hiccup,
+/// short enough that a real slip costs under a quarter second of inversion.
+const REALIGN_HOLD_SWAPS: u64 = 24;
+/// Steps larger than this are resyncs after starvation, not single events:
+/// adopt them silently instead of spending a correction pair.
+const MAX_SLIP_STEP: i64 = 8;
+
+impl SlipTracker {
+    /// Folds one batch of freshly drained swaps in.  `fires_fired` is the
+    /// caller's packet counter; `corrections` counts performed re-alignments.
+    fn observe(
+        &mut self,
+        batch_len: usize,
+        fires_fired: u64,
+        swaps_seen: &mut u64,
+        corrections: &mut u64,
+        pending_flip: &mut bool,
+    ) {
+        for _ in 0..batch_len {
+            *swaps_seen += 1;
+            let delta = *swaps_seen as i64 - fires_fired as i64;
+            if let Some(s0) = self.stable_since {
+                if delta == self.prev_delta {
+                    if swaps_seen.wrapping_sub(s0) >= REALIGN_HOLD_SWAPS {
+                        // Delta settled on this value: a confirmed step.
+                        let step = delta - self.baseline;
+                        if step != 0 {
+                            if step.abs() <= MAX_SLIP_STEP && step & 1 == 1 {
+                                // Odd step: eye parity inverted -> re-align the
+                                // alternator base with one same-eye pair.
+                                *pending_flip = true;
+                                *corrections += 1;
+                            }
+                            self.baseline = delta;
+                        }
+                        self.stable_since = Some(*swaps_seen);
+                    }
+                } else {
+                    self.prev_delta = delta;
+                    self.stable_since = Some(*swaps_seen);
+                }
+            } else {
+                // Very first observation seeds the baseline: whatever phase
+                // lead the streams start with is healthy by definition.
+                self.baseline = delta;
+                self.prev_delta = delta;
+                self.stable_since = Some(*swaps_seen);
             }
-            *last_fired_eye // repeat: the previous frame is still on screen
         }
     }
 }
@@ -387,12 +436,39 @@ pub fn run() {
     // exactly the mechanism 3dv3d relies on to shutter under a compositor.
     // If unavailable (no /dev/dri vblank), we fall back to firing on the
     // game's presents directly.
-    let mut drm_anchor = drm::DrmVblank::open();
+    //
+    // NVSTUSB_ANCHOR_OUTPUT=<connector> (e.g. DP-2) binds the anchor to that
+    // specific head instead of the first usable one.  On multi-head setups
+    // every CRTC free-runs with its own phase offset, so the anchor MUST be
+    // the monitor that actually displays the game -- a mismatch shows up as a
+    // constant wrong-eye bias no button press can fix reliably.
+    let pref_connector: Option<String> = std::env::var("NVSTUSB_ANCHOR_OUTPUT")
+        .ok()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty());
+    let mut drm_anchor = drm::DrmVblank::open_preferring(pref_connector.as_deref(), None);
+    if pref_connector.is_some() {
+        eprintln!(
+            "nvstusb-host: anchor output preference: {:?}",
+            pref_connector
+        );
+    }
 
     // --- Main loop --------------------------------------------------------
     let mut last_rate = rate_hz;
     let mut last_delay = delay_us;
     let mut buf = [0u8; 64];
+
+    // Pre-boundary fire lead (NVSTUSB_HOST_LEAD_US).  Fixed for the process
+    // lifetime, like the demo's startup phase default.
+    let host_lead_us = fire_lead_us();
+
+    // Manual polarity override, toggled by the emitter's 3D button (the
+    // host-side equivalent of the demo's `i` key).  A systematic +/-1 slot
+    // offset between the game's submit->scanout pipeline depth and our fire
+    // grid is invisible to every in-band check -- see the module docs -- so
+    // there must be a human switch for it.
+    let mut manual_invert = false;
 
     // Per-second stream telemetry.  The glasses only lock when the packet
     // stream strictly alternates L/R and the period stays inside the RP2040
@@ -401,65 +477,34 @@ pub fn run() {
     // numbers instead of us guessing.
     let mut dbg = StreamStats::default();
 
-    // --- Content-follow queue -----------------------------------------------
-    // The DLL enqueues one eye per present, in display order, into a lock-free
-    // FIFO (`shm.rs`). Each vblank-anchored fire pops exactly one entry and
-    // fires it directly -- no prediction, no polarity tracking. This is
-    // correct as long as the game presents at most one frame per real vblank
-    // slot (true for a frame-sequential stereo present loop): the Nth queued
-    // eye IS the eye for the Nth fire, in order, full stop.
-    //
-    // `last_fired_eye` is only consulted on an underrun (queue empty at fire
-    // time -- the game hasn't presented a new frame for this slot). A missed
-    // present does NOT blank the display: the previous flip is still on
-    // screen, so the physically correct fallback is to REPEAT last_fired_eye,
-    // not flip it. Flipping fires the opposite eye's shutter while the old
-    // eye's frame is still showing -- a genuine wrong-eye flash, not just a
-    // duplicate-frame stat. The queue resumes driving the eye choice the
-    // instant new swaps land, and the repeat naturally yields exactly one
-    // same-eye pair per real stall (unavoidable -- the content itself
-    // repeated), instead of a wrong-eye flash plus a same-eye pair.
-    //
-    // That repeat is content-correct but is not a strict alternation, so a
-    // *sustained* run of underruns (e.g. 60fps content on a 120Hz display)
-    // would push the fired stream to L,L,R,R and the glasses would fall out
-    // of lock. `pick_eye` hands the source over to the alternator once the
-    // underrun run proves the game is no longer feeding one frame per slot.
-    let mut pending_eyes: VecDeque<bool> = VecDeque::with_capacity(MAX_QUEUED_EYES);
-    let mut last_fired_eye: bool = false;
-    let mut underruns: u64 = 0;
-    let mut dropped_stale: u64 = 0;
+    // --- Eye source: strict alternator on the vblank grid ------------------
+    // See the module docs for why the ring cannot provide the eye.  The
+    // alternator produces the one stream the glasses can lock (strictly
+    // alternating, stable ~8.3 ms period) and the DLL's present count is used
+    // only to detect discrete slips (dropped/doubled presents).
+    let mut fire_eye: bool = false; // alternator's next eye (strictly alternates)
+    let mut pending_flip = false;   // insert one same-eye pair at next slot
+    let mut slip = SlipTracker::new();
+    let mut swaps_seen: u64 = 0;    // presents consumed from the ring
+    let mut fires_fired: u64 = 0;   // packets emitted
+    let mut corrections: u64 = 0;   // polarity re-alignments performed
     let mut last_swap = Instant::now();
 
-    // Backup (host (2).rs style): a strict L/R alternator plus a polarity
-    // tracker.  The FIFO above is ideal while the game presents one frame per
-    // vblank slot; when a dropped/hitched present slips that alignment the
-    // FIFO fires the wrong eye persistently, and when the game drops to half
-    // rate (60fps on a 120Hz display) the FIFO underruns every other slot and
-    // the fired stream stops alternating (L,L,R,R), breaking the glasses lock.
-    // Either failure switches the eye source to the strict alternator until
-    // the stream proves full-rate and lock-step again.
-    let mut backup_active = false;   // fire the alternator, not the FIFO
-    let mut fire_eye: bool = false;  // alternator's next eye (strictly alternates)
-    let mut base: Option<bool> = None; // tracked L/R polarity of the game
-    let mut drift: i64 = 0;          // net agreement of swaps vs. our base
-    let mut corrections: u64 = 0;    // polarity re-alignments performed
-    let mut pending_flip = false;    // insert one same-eye pair at next slot
-    let mut swapped_seen: u64 = 0;   // presents consumed (parity reference)
-    // Backup entry/exit bookkeeping (see `pick_eye`).
-    let mut ur_counter: u64 = 0;     // FIFO underruns since last healthy proof
-    let mut clean_run: u64 = 0;      // consecutive clean FIFO pops
-    let mut backup_swaps: u64 = 0;   // swaps seen while the alternator is active
-    let mut backup_fires: u64 = 0;   // fires emitted while the alternator is active
+    // Burst visibility: how many drains carried >=2 swaps (multiple presents
+    // landed since the previous drain -- coalescing/burst signature), and the
+    // deepest batch this telemetry window.
+    let mut batches_ge2: u64 = 0;
+    let mut max_batch: usize = 0;
+    let mut swaps_this_window: u64 = 0;
 
     // Look-ahead diagnostic: how early (in us) do swap arrivals land vs. the
-    // vblank grid. Large values confirm there's ample lead for FIFO
-    // content-follow; values near/at ALARM_DELAY_US+HOST_LEAD_US mean swaps
-    // are arriving close to the fire deadline and `underruns` is worth
-    // watching.
+    // vblank grid. Under blocking presents arrivals cluster just AFTER a
+    // boundary (small values ~hundreds of us); large spread means the present
+    // path is not boundary-locked.
     let mut lead_n: u64 = 0;
     let mut lead_sum: u64 = 0;
     let mut lead_min: u64 = 0;
+    let mut lead_max: u64 = 0;
 
     // Host-epoch of the most recent vblank we waited on (for the lead calc).
     let mut last_vblank_epoch: Option<u64> = None;
@@ -484,12 +529,26 @@ pub fn run() {
         }
 
         // Absorb any new swaps the game pushed. A fresh swap means the game is
-        // presenting (keeps us alive); it's also queued verbatim, in order, to
-        // be popped as the fire eye for the next vblank slot(s) -- no
-        // interpretation, just FIFO.
-        let got = shm.drain();
-        if !got.is_empty() {
+        // presenting (keeps us alive); it feeds the slip tracker (present
+        // COUNT vs our fire count), nothing more -- see the module docs for
+        // why the eye itself must come from the alternator.  A second
+        // ingestion pass runs right after the vblank wait so swaps pushed mid-
+        // slot are counted against the correct fire immediately.
+        let batch = shm.drain();
+        if !batch.is_empty() {
+            if batch.len() >= 2 {
+                batches_ge2 += 1;
+            }
+            max_batch = max_batch.max(batch.len());
+            swaps_this_window += batch.len() as u64;
             last_swap = Instant::now();
+            slip.observe(
+                batch.len(),
+                fires_fired,
+                &mut swaps_seen,
+                &mut corrections,
+                &mut pending_flip,
+            );
             // Where in the vblank frame this batch of swaps landed: the time
             // remaining to the next vblank is our look-ahead budget.
             if let (Some(anchor), Some(vb)) = (drm_anchor.as_ref(), last_vblank_epoch) {
@@ -502,67 +561,10 @@ pub fn run() {
                     if lead_min == 0 || to_next < lead_min {
                         lead_min = to_next;
                     }
-                }
-            }
-            for eye in got {
-                let v = eye == EYE_RIGHT;
-                // While the alternator backup is active the FIFO is suspended
-                // (we do not content-follow); instead we count swaps against
-                // fires so `pick_eye` can detect the stream returning to full
-                // cadence and resume the FIFO.
-                if backup_active {
-                    backup_swaps += 1;
-                } else {
-                    pending_eyes.push_back(v);
-                }
-                // Backup: track the game's sequence parity (eye XOR present
-                // index).  A healthy alternating L/R stream has constant
-                // parity; a dropped or hitched present flips it and keeps it
-                // flipped -- the exact failure of the "every frame is perfect"
-                // FIFO assumption.  Only a sustained inversion (a full drift
-                // window) re-aligns the alternator's polarity.
-                let sf = v ^ ((swapped_seen & 1) == 1);
-                swapped_seen += 1;
-                match base {
-                    None => {
-                        base = Some(sf);
-                        drift = 0;
-                    }
-                    Some(b) => {
-                        if sf == b {
-                            drift = drift.saturating_add(1);
-                        } else {
-                            drift = drift.saturating_sub(1);
-                        }
-                        drift = drift.clamp(-DRIFT_WINDOW, DRIFT_WINDOW);
-                        if drift <= -DRIFT_WINDOW {
-                            // Confirmed slip: content-follow is now off by a
-                            // frame.  Re-align the tracked polarity (a single
-                            // same-eye pair via pending_flip) and switch to the
-                            // strict alternator; the stale FIFO is cleared so a
-                            // fresh, aligned queue is rebuilt once we resume.
-                            base = Some(!b);
-                            drift = 0;
-                            corrections += 1;
-                            last_swap = Instant::now();
-                            pending_flip = true;
-                            backup_active = true;
-                            backup_fires = 0;
-                            backup_swaps = 0;
-                            pending_eyes.clear();
-                        }
+                    if to_next > lead_max {
+                        lead_max = to_next;
                     }
                 }
-            }
-            // A backlog this deep means the fire loop has fallen well behind
-            // the game's swap stream (host scheduling hiccup, not a real
-            // desync) -- drop the oldest rather than let fire-time latency
-            // grow unbounded, but count it: unlike a genuine underrun, this
-            // is real data we're choosing to discard, worth telling apart in
-            // the log.
-            while pending_eyes.len() > MAX_QUEUED_EYES {
-                pending_eyes.pop_front();
-                dropped_stale += 1;
             }
         }
 
@@ -586,29 +588,56 @@ pub fn run() {
             // process must leave the emitter silent, not looping forever).
             let alive = last_swap.elapsed() <= Duration::from_millis(300);
 
+            // Poll the emitter's buttons/wheel (same readback as the demo's
+            // get_keys).  The 3D button toggles the manual polarity override:
+            // press it whenever depth perception says eyes are swapped.
+            // Deliberately placed BEFORE the blocking vblank wait so its USB
+            // latency cannot shift the fire deadline.
+            {
+                let cmd: [u8; 4] = [0x42, 0x18, 0x03, 0x00];
+                let _ = d.write_bulk(2, &cmd);
+                let mut rb = [0u8; 7];
+                let _ = d.read_bulk(4, &mut rb);
+                if rb[6] & 0x01 != 0 {
+                    manual_invert = !manual_invert;
+                    eprintln!(
+                        "nvstusb-host: emitter button -> eye inversion {}",
+                        if manual_invert { "ON" } else { "OFF" }
+                    );
+                }
+            }
+
             match drm_anchor.as_mut() {
                 // --- Hardware-vblank anchored emission -------------------
                 // One packet per real vblank slot, timed to the display vblank
-                // clock. The eye is popped straight off `pending_eyes` -- the
-                // DLL's actual report for that slot -- and pre-fired
-                // ~ALARM_DELAY_US before the present vblank so the shutter
-                // opens exactly as that frame appears.
+                // clock; the eye is the strict alternation (module docs).
                 Some(anchor) if alive => {
                     match anchor.wait_vblank_blocking() {
                         Some(vblank_us) => {
                             last_vblank_epoch = Some(vblank_us);
-                            let eye = pick_eye(
-                                &mut pending_eyes,
-                                &mut last_fired_eye,
-                                &mut underruns,
-                                &mut ur_counter,
-                                &mut clean_run,
-                                &mut fire_eye,
-                                &mut pending_flip,
-                                &mut backup_active,
-                                &mut backup_swaps,
-                                &mut backup_fires,
-                            );
+                            // Late-ingest pass (count accuracy): swaps pushed
+                            // since the top-of-loop drain are folded into the
+                            // slip tracker HERE, at the boundary itself, so a
+                            // present that landed inside this very slot is
+                            // attributed to it rather than the next one.
+                            let late = shm.drain();
+                            if !late.is_empty() {
+                                if late.len() >= 2 {
+                                    batches_ge2 += 1;
+                                }
+                                max_batch = max_batch.max(late.len());
+                                swaps_this_window += late.len() as u64;
+                                last_swap = Instant::now();
+                                slip.observe(
+                                    late.len(),
+                                    fires_fired,
+                                    &mut swaps_seen,
+                                    &mut corrections,
+                                    &mut pending_flip,
+                                );
+                            }
+                            let eye = fire_eye;
+                            advance_eye(&mut fire_eye, &mut pending_flip);
                             let alarm = if last_delay > 0 {
                                 last_delay as u64
                             } else {
@@ -616,71 +645,57 @@ pub fn run() {
                             };
                             let next_present = vblank_us.saturating_add(anchor.period_us());
                             let fire_at = anchor.instant_of(
-                                next_present.saturating_sub(alarm + HOST_LEAD_US),
+                                next_present.saturating_sub(alarm + host_lead_us),
                             );
                             while Instant::now() < fire_at {
                                 std::hint::spin_loop();
                             }
-                            d.send_eye(eye, rate_hz);
-                            dbg.record(eye);
-                            last_fired_eye = eye;
+                            // manual_invert applies at the wire only.
+                            let out = eye != manual_invert;
+                            d.send_eye(out, rate_hz);
+                            dbg.record(out);
+                            fires_fired += 1;
                         }
                         None => {
                             // Anchor died: fire immediately to stay live.
-                            let eye = pick_eye(
-                                &mut pending_eyes,
-                                &mut last_fired_eye,
-                                &mut underruns,
-                                &mut ur_counter,
-                                &mut clean_run,
-                                &mut fire_eye,
-                                &mut pending_flip,
-                                &mut backup_active,
-                                &mut backup_swaps,
-                                &mut backup_fires,
-                            );
-                            d.send_eye(eye, rate_hz);
-                            dbg.record(eye);
-                            last_fired_eye = eye;
+                            let eye = fire_eye;
+                            advance_eye(&mut fire_eye, &mut pending_flip);
+                            let out = eye != manual_invert;
+                            d.send_eye(out, rate_hz);
+                            dbg.record(out);
+                            fires_fired += 1;
                         }
                     }
                 }
                 // Anchor present but idle (no swaps recently): stay silent.
                 Some(_) => {
-                    // Don't let idle drain batches pollute the backup resume
-                    // cadence estimate (swaps with no matching fires).
-                    backup_swaps = 0;
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 // --- No DRM anchor: fire on the presents directly. ------
+                // Timing quality is limited without the anchor (packets go out
+                // on wake arrival); fix the anchor permissions instead of
+                // tuning here.  The alternator still keeps the LOCK alive.
                 None => {
                     if alive {
-                        let eye = pick_eye(
-                            &mut pending_eyes,
-                            &mut last_fired_eye,
-                            &mut underruns,
-                            &mut ur_counter,
-                            &mut clean_run,
-                            &mut fire_eye,
-                            &mut pending_flip,
-                            &mut backup_active,
-                            &mut backup_swaps,
-                            &mut backup_fires,
-                        );
-                        d.send_eye(eye, rate_hz);
-                        dbg.record(eye);
-                        last_fired_eye = eye;
+                        let eye = fire_eye;
+                        advance_eye(&mut fire_eye, &mut pending_flip);
+                        let out = eye != manual_invert;
+                        d.send_eye(out, rate_hz);
+                        dbg.record(out);
+                        fires_fired += 1;
                     }
                 }
             }
 
             dbg.tick(
                 corrections,
-                &mut underruns,
-                &mut dropped_stale,
+                &mut swaps_this_window,
+                &mut batches_ge2,
+                &mut max_batch,
                 &mut lead_n,
                 &mut lead_sum,
                 &mut lead_min,
+                &mut lead_max,
             );
         }
     }

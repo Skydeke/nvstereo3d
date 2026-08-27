@@ -19,6 +19,8 @@ use std::ffi::{c_char, c_int, c_short, c_ulong, c_void};
 use std::fs::File;
 use std::mem;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // DRM ABI (linux/drm.h + drm_mode.h).  Sizes are static-asserted below.
@@ -229,6 +231,73 @@ const GBM_BO_USE_SCANOUT: u32 = 1 << 0;
 const GBM_BO_USE_RENDERING: u32 = 1 << 1;
 
 // ---------------------------------------------------------------------------
+// Present-stage diagnostics
+//
+// The VT session showed a rock-steady ~3-vblank frame cadence whose cause
+// could not be attributed from the outside: "swap write" only measures the
+// USB eye packet, so the entire present pipeline was a black box. These
+// per-stage accumulators break it open - swap (eglSwapBuffers incl. flush +
+// any driver throttle), lock (gbm lock_front + ADDFB2), flipq (the page-flip
+// ioctl) and flipwait (blocking on the FLIP_COMPLETE event) - so the perf
+// report shows exactly which stage eats the periods. Statics because the
+// sampler runs inside `present(&mut self)` while the printer lives on the
+// app side; all counters reset on read (perf-window semantics).
+// ---------------------------------------------------------------------------
+
+struct Stage {
+    n: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl Stage {
+    const fn new() -> Self {
+        Self {
+            n: AtomicU64::new(0),
+            total_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+        }
+    }
+
+    fn sample(&self, us: u64) {
+        self.n.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        let mut prev = self.max_us.load(Ordering::Relaxed);
+        while us > prev {
+            match self
+                .max_us
+                .compare_exchange_weak(prev, us, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    /// (count, avg us, max us); resets the accumulator.
+    fn take(&self) -> Option<(u64, u64, u64)> {
+        let n = self.n.swap(0, Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        Some((
+            n,
+            self.total_us.swap(0, Ordering::Relaxed) / n,
+            self.max_us.swap(0, Ordering::Relaxed),
+        ))
+    }
+}
+
+static ST_SWAP: Stage = Stage::new();
+static ST_LOCK: Stage = Stage::new();
+static ST_FLIPQ: Stage = Stage::new();
+static ST_WAIT: Stage = Stage::new();
+/// Frames where eglGetError returned non-SUCCESS right after
+/// eglSwapBuffers - the visible symptom of rejected GPU pushes (the nouveau
+/// `fail ttm_validate` / pushbuf-EINVAL class of failures).
+static ST_EGLERR: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
 // EGL ABI (EGL/egl.h) — resolved at runtime.
 // ---------------------------------------------------------------------------
 
@@ -260,6 +329,9 @@ const EGL_CONTEXT_MAJOR_VERSION: EglInt = 0x3098;
 const EGL_CONTEXT_MINOR_VERSION: EglInt = 0x30FB;
 const EGL_NONE: EglInt = 0x3038;
 const EGL_TRUE: EglBoolean = 1;
+/// Surface attributes carrying the driver's accepted swap-interval range.
+const EGL_MIN_SWAP_INTERVAL: EglInt = 0x30F7;
+const EGL_MAX_SWAP_INTERVAL: EglInt = 0x30F8;
 
 struct EglFns {
     display: EglDisplay,
@@ -269,14 +341,16 @@ struct EglFns {
     swap_buffers: unsafe extern "C" fn(EglDisplay, EglSurface) -> EglBoolean,
     swap_interval: unsafe extern "C" fn(EglDisplay, EglInt) -> EglBoolean,
     make_current: unsafe extern "C" fn(EglDisplay, EglSurface, EglSurface, EglContext) -> EglBoolean,
+    query_surface: unsafe extern "C" fn(EglDisplay, EglSurface, EglInt, *mut EglInt) -> EglBoolean,
     get_proc_addr: unsafe extern "C" fn(*const c_char) -> *const c_void,
     terminate: unsafe extern "C" fn(EglDisplay) -> EglBoolean,
     destroy_surface: unsafe extern "C" fn(EglDisplay, EglSurface) -> EglBoolean,
     destroy_context: unsafe extern "C" fn(EglDisplay, EglContext) -> EglBoolean,
     /// Whether `eglSwapInterval(display, 0)` was rejected by the driver, i.e.
     /// whether `eglSwapBuffers` is still expected to eat one vblank of
-    /// throttle before our manual page flip. See the comment at the call
-    /// site in `init_egl`.
+    /// throttle before our manual page flip. Decided in [`KmsDisplay::
+    /// make_current`] - the call is only valid once a context is current -
+    /// and re-derived from measured present errors at runtime either way.
     vsync_throttled: bool,
 }
 
@@ -445,11 +519,36 @@ impl KmsDisplay {
 
     /// Makes the EGL context current so rendering can proceed.  Called once
     /// at startup; `present()` keeps the context current for its lifetime.
-    pub fn make_current(&self) -> Result<(), String> {
+    pub fn make_current(&mut self) -> Result<(), String> {
         let ok = unsafe { (self.egl.make_current)(self.egl.display, self.egl.surface, self.egl.surface, self.egl.context) };
         if ok != EGL_TRUE {
             return Err(format!("eglMakeCurrent failed: {:#x}", self.egl_error()));
         }
+
+        // NOW the swap-interval request is valid: a context is current and
+        // this surface is its draw surface. Ask for interval 0 so
+        // eglSwapBuffers stays asynchronous and OUR page flip is the sole
+        // vblank pacer (a throttled swap delays the flip by one full period,
+        // halving throughput on top of the flip's own latency).
+        let accepted = unsafe { (self.egl.swap_interval)(self.egl.display, 0) } == EGL_TRUE;
+        let err = if accepted { EGL_SUCCESS } else { unsafe { (self.egl.get_error)() } };
+        let mut min = EglInt::default();
+        let mut max = EglInt::default();
+        let range_ok = unsafe { (self.egl.query_surface)(self.egl.display, self.egl.surface, EGL_MIN_SWAP_INTERVAL, &mut min) } == EGL_TRUE
+            && unsafe { (self.egl.query_surface)(self.egl.display, self.egl.surface, EGL_MAX_SWAP_INTERVAL, &mut max) } == EGL_TRUE;
+        eprintln!(
+            "nvstusb: eglSwapInterval(0) {} ({:#x}; accepted range {}..{})",
+            if accepted { "accepted" } else { "REJECTED" },
+            err,
+            if range_ok { min.to_string() } else { "?".to_string() },
+            if range_ok { max.to_string() } else { "?".to_string() },
+        );
+        if !accepted {
+            eprintln!(
+                "nvstusb: falling back to driver-throttled swaps; eye inversion compensates"
+            );
+        }
+        self.egl.vsync_throttled = !accepted;
         Ok(())
     }
 
@@ -466,6 +565,32 @@ impl KmsDisplay {
         self.egl.vsync_throttled
     }
 
+    /// One-line summary of the per-stage present costs accumulated since
+    /// the last call, or `None` when nothing was sampled (e.g. the windowed
+    /// backend). Printed by the demo's perf report; resets on read.
+    pub fn take_present_stats_line() -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        for (name, stage) in [
+            ("swap", &ST_SWAP),
+            ("lock", &ST_LOCK),
+            ("flipq", &ST_FLIPQ),
+            ("flipwait", &ST_WAIT),
+        ] {
+            if let Some((n, avg, max)) = stage.take() {
+                parts.push(format!("{name} avg={avg}us max={max}us n={n}"));
+            }
+        }
+        let egl_err = ST_EGLERR.swap(0, Ordering::Relaxed);
+        if egl_err > 0 {
+            parts.push(format!("egl-err-after-swap n={egl_err}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" | "))
+        }
+    }
+
     /// Presents the current back buffer by swapping EGL buffers and page
     /// flipping it to the CRTC, blocking until the flip lands on a vblank.
     /// The first call uses `SETCRTC` to establish the mode.
@@ -474,6 +599,7 @@ impl KmsDisplay {
     /// microseconds) when one is available - i.e. every call except the
     /// first, which mode-sets synchronously and has no flip event to read.
     pub fn present(&mut self) -> Result<Option<u64>, String> {
+        let t0 = Instant::now();
         let ok = unsafe { (self.egl.swap_buffers)(self.egl.display, self.egl.surface) };
         if ok != EGL_TRUE {
             let free = unsafe { (self.gbm.has_free_buffers)(self.gbm.surface) };
@@ -483,14 +609,25 @@ impl KmsDisplay {
                 free
             ));
         }
+        // Flush errors are deferred: a failed GPU submit often still returns
+        // EGL_TRUE from SwapBuffers and only shows up here. Count them - a
+        // nonzero rate correlates with the kernel's `fail ttm_validate`
+        // spam and explains missing/stalled frames.
+        if unsafe { (self.egl.get_error)() } != EGL_SUCCESS {
+            ST_EGLERR.fetch_add(1, Ordering::Relaxed);
+        }
+        ST_SWAP.sample(t0.elapsed().as_micros() as u64);
 
+        let t1 = Instant::now();
         let next_bo = unsafe { (self.gbm.lock_front)(self.gbm.surface) };
         if next_bo.is_null() {
             return Err("gbm_surface_lock_front_buffer returned NULL".into());
         }
         let fb = self.add_fb(next_bo)?;
+        ST_LOCK.sample(t1.elapsed().as_micros() as u64);
         let fd = self.file.as_raw_fd();
 
+        let t2 = Instant::now();
         let r = if self.first {
             unsafe {
                 ioctl(
@@ -531,6 +668,7 @@ impl KmsDisplay {
             let _ = unsafe { ioctl(fd, DRM_IOCTL_MODE_RMFB, &fb) };
             return Err(format!("page flip failed: {e}"));
         }
+        ST_FLIPQ.sample(t2.elapsed().as_micros() as u64);
 
         if self.first {
             // SETCRTC is synchronous and takes effect at the next vblank.
@@ -542,7 +680,9 @@ impl KmsDisplay {
 
         // Block until the flip completes at a vblank, then the previously
         // scanned buffer is free to reuse.
+        let t3 = Instant::now();
         let flip_mono_us = self.wait_flip()?;
+        ST_WAIT.sample(t3.elapsed().as_micros() as u64);
         if self.cur_fb != 0 {
             let _ = unsafe { ioctl(fd, DRM_IOCTL_MODE_RMFB, &self.cur_fb) };
         }
@@ -873,6 +1013,8 @@ fn init_egl(
         sym(egl_lib, b"eglSwapBuffers\0").ok_or("libEGL missing eglSwapBuffers")?;
     let swap_interval: unsafe extern "C" fn(EglDisplay, EglInt) -> EglBoolean =
         sym(egl_lib, b"eglSwapInterval\0").ok_or("libEGL missing eglSwapInterval")?;
+    let query_surface: unsafe extern "C" fn(EglDisplay, EglSurface, EglInt, *mut EglInt) -> EglBoolean =
+        sym(egl_lib, b"eglQuerySurface\0").ok_or("libEGL missing eglQuerySurface")?;
     let terminate: unsafe extern "C" fn(EglDisplay) -> EglBoolean =
         sym(egl_lib, b"eglTerminate\0").ok_or("libEGL missing eglTerminate")?;
     let destroy_surface: unsafe extern "C" fn(EglDisplay, EglSurface) -> EglBoolean =
@@ -1023,27 +1165,18 @@ fn init_egl(
         return Err(format!("eglCreateWindowSurface failed: {:#x}", last_err));
     }
 
-    // Ask for an asynchronous swap (interval 0): eglSwapBuffers is called at
-    // `predicted vblank - 3000` and a vblank-throttled swap would push our own
-    // page flip a full frame late (observed: present err ~ -1 period). We alone
-    // schedule the flip via DRM_IOCTL_MODE_PAGE_FLIP.
+    // NOTE: `eglSwapInterval` is NOT called here. Per the EGL spec the
+    // interval applies to "the current context's draw surface" - calling it
+    // before any context is current makes Mesa reject it with
+    // EGL_BAD_PARAMETER regardless of the requested value, which we misread
+    // as "this driver throttles unconditionally". The real request (and the
+    // min/max range query) happens in [`KmsDisplay::make_current`], where a
+    // context is current and the answer is authoritative.
     //
-    // Some drivers reject interval 0 (EGL_BAD_NATIVE_WINDOW, 0x3006) and keep
-    // the vblank throttle; that is a known, working configuration because the
-    // eye inversion in mod.rs compensates for the resulting -1 period present
-    // offset. It is a warning, not a fatal error.
-    let vsync_throttled = unsafe { (swap_interval)(display, 0) } != EGL_TRUE;
-    if vsync_throttled {
-        eprintln!(
-            "nvstusb: eglSwapInterval(0) rejected ({:#x}); the driver keeps its vblank throttle, \
-             expected - eye inversion compensates",
-            unsafe { (get_error)() }
-        );
-    } else {
-        eprintln!(
-            "nvstusb: eglSwapInterval(0) accepted; no extra vblank throttle, eye inversion disabled"
-        );
-    }
+    // Provisional until make_current decides: assume throttled, matching the
+    // behavior the old ordering accidentally produced, so the eye inversion
+    // starts from the historically-correct assumption either way.
+    let vsync_throttled = true;
 
     Ok(EglFns {
         display,
@@ -1053,6 +1186,7 @@ fn init_egl(
         swap_buffers,
         swap_interval,
         make_current,
+        query_surface,
         get_proc_addr,
         terminate,
         destroy_surface,

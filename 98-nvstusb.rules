@@ -1,2 +1,23 @@
 # NVIDIA 3D Vision USB IR Emitter
+#
+# Install:  sudo cp 98-nvstusb.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger
+# Then re-plug the emitter.  Without these rules only root can open the
+# device, which the demo reports as "present but cannot be opened
+# (permissions)".
+#
+# The external dongle is 0955:0007.  Integrated emitters (built into monitors
+# or laptops) may enumerate under one of the alternate PIDs below (the same
+# list 3DVisionActivator probes) - or under something else entirely; check
+# `lsusb` and copy a line with that id.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="0007", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7001", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7002", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7003", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7004", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7008", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7009", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="700a", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="700c", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="700d", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="700e", MODE="0666"

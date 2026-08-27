@@ -124,12 +124,17 @@ type XF86VidModeGetModeLineFn =
 /// tries, in order:
 ///
 /// 1. `NVSTUSB_RATE` environment override (e.g. `NVSTUSB_RATE=120`);
-/// 2. the X11 `XF86VidMode` mode line;
-/// 3. a 120 Hz default (with a warning).
+/// 2. `preferred_mhz`, the wl_output mode rate of the monitor the window is
+///    on (passed by the app on Wayland). This - not XF86VidMode - is the rate
+///    that must be configured when several displays with different refresh
+///    rates are attached: XWayland reports the X screen's global rate, which
+///    may be the OTHER monitor's;
+/// 3. the X11 `XF86VidMode` mode line;
+/// 4. a 120 Hz default (with a warning).
 ///
 /// Every path ends in `ctx.set_rate(...)`, guaranteeing the emitter gets its
 /// driver-enable and a sane refresh rate even on headless / Wayland systems.
-pub fn config_refresh_rate(ctx: &mut NvstusbContext) {
+pub fn config_refresh_rate(ctx: &mut NvstusbContext, preferred_mhz: Option<u32>) {
     // Env override wins outright (handles headless, unknown display, etc.).
     if let Some(raw) = std::env::var_os("NVSTUSB_RATE") {
         if let Ok(s) = raw.into_string() {
@@ -142,6 +147,20 @@ pub fn config_refresh_rate(ctx: &mut NvstusbContext) {
                 eprintln!("stereo_helper: ignoring invalid NVSTUSB_RATE={v} (must be > 60)");
             }
         }
+    }
+
+    // Per-monitor Wayland/winit rate of the output actually showing the demo.
+    if let Some(mhz) = preferred_mhz {
+        if mhz >= 60_000 {
+            let f = mhz as f64 / 1000.0;
+            println!("Using monitor refresh rate of {f:.6} Hz.");
+            ctx.set_rate(f as f32);
+            return;
+        }
+        eprintln!(
+            "stereo_helper: ignoring implausible monitor refresh {} mHz; probing X11",
+            mhz
+        );
     }
 
     let x11 = match unsafe { Library::new("libX11.so.6") } {

@@ -166,9 +166,15 @@ impl Shm {
         self.status.store(status, Ordering::Relaxed);
     }
 
-    /// Reports a capability/state flag to the DLL.
+    /// Reports capability/state flags to the DLL.  ORs the bits in so a
+    /// concurrent writer is never clobbered.
     pub fn set_flags(&self, flags: u32) {
-        self.flags.store(flags, Ordering::Relaxed);
+        self.flags.fetch_or(flags, Ordering::Relaxed);
+    }
+
+    /// Current header flags (both directions).
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
     }
 
     /// Producer (DLL) side: pushes one eye-swap command.  Returns `false` if
