@@ -213,7 +213,20 @@ pub struct NvstusbContext {
     /// Set when a swap-gap anomaly shows content held an extra boundary;
     /// suppresses one packet so the glasses hold in lockstep.
     suppress_next_packet: bool,
+    /// Number of `swap()` calls made. Used to let the lazy method-1 kernel
+    /// anchor fall back to the old first-active-head blind scan after a short
+    /// grace period when the window's output is never reported (compositors
+    /// without working wl_output), instead of arming blind on whatever pipe is
+    /// index 0 immediately at startup - on a multi-head GPU that fires the
+    /// first ~hundred packets off the WRONG head's vblank grid and then
+    /// re-targets, which reads as the left/right eyes flashing a couple of
+    /// times right after launch.
+    swap_calls: u64,
 }
+
+/// How many swaps to wait for the window's wl_output to be reported before the
+/// method-1 anchor gives up and does the old first-active-head blind scan.
+pub(crate) const ARM_GRACE_SWAPS: u64 = 240;
 
 /// Runtime-loaded EGL entry points + handles backing [`NvstusbContext::egl_clock`].
 struct EglClock {
@@ -310,6 +323,7 @@ pub fn init() -> Option<NvstusbContext> {
         last_swap_return: None,
         last_packet_boundary: None,
         suppress_next_packet: false,
+        swap_calls: 0,
     })
 }
 
@@ -720,6 +734,7 @@ impl NvstusbContext {
     /// supply one (currently only the KMS path; other backends return
     /// `None`). `gl` is only used by the software vblank method.
     pub fn swap<F: FnMut() -> Option<u64>>(&mut self, eye: Eye, gl: &gl::Gl, mut swap_func: F) {
+        self.swap_calls += 1;
         match self.vblank_method {
             // Software vsync: swap, then read from the front buffer, which can
             // only complete after the swap has finished.
@@ -800,6 +815,18 @@ impl NvstusbContext {
                 if !self.drm_tried
                     && self.x11_display == 0
                     && self.egl_clock.is_none()
+                    && (self.pipe_cycle != 0
+                        || self.target_connector.is_some()
+                        // Blind first-active-head fallback: only after the
+                        // wl_output has had a few seconds to be reported. The
+                        // gate on target_connector is what keeps the anchor
+                        // from arming on an arbitrary head at startup and
+                        // then re-targeting (a packet-phase jump mid-launch,
+                        // seen as the left/right eyes switching a couple of
+                        // times). With the demo polling the output every
+                        // frame until it is known, the anchor engages on the
+                        // correct head within the first couple of frames.
+                        || self.swap_calls >= ARM_GRACE_SWAPS)
                 {
                     self.drm_tried = true;
                     // pipe_cycle == 0 -> auto (bind by window output, else

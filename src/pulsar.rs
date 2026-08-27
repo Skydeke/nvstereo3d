@@ -1,5 +1,5 @@
 //! Paul Bourke's "pulsar" scene, ported from `3dvgl-c/src/scene.cpp` (merged
-//! as scene mode "3"). `glutSolidSphere` (a GLUT helper) is replaced by an
+//! as scene mode "4"). `glutSolidSphere` (a GLUT helper) is replaced by an
 //! equivalent latitude/longitude tessellation so the Rust demo has no GLUT
 //! dependency.
 //!

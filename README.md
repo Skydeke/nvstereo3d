@@ -27,10 +27,10 @@ Scene keys:
 
 | Key | Scene                   |
 |-----|-------------------------|
-| `1` | hexagon / triangles diagnostic pattern (default) |
-| `2` | "pulsar" (Paul Bourke's scene) |
-| `3` | random-dot stereogram (`medimg`) |
-| `4` | alternating blue/red sync checker |
+| `1` | hexagon / triangles diagnostic pattern (default; each eye's frame is labelled on screen) |
+| `2` | random-dot stereogram (`medimg`) |
+| `3` | alternating blue/red sync checker |
+| `4` | "pulsar" (Paul Bourke's scene) |
 
 Startup tries the **KMS/DRM** backend first (renders straight to the display
 engine; best on a bare VT with the projector at 120 Hz). If it cannot take the
@@ -42,6 +42,13 @@ compositor):
 Headless sanity check without the emitter and display:
 
     NVSTUSB_KMS=1 ./target/release/3dv3d --no-emitter
+
+Scene assets that are expensive to build (the `medimg` random-dot field,
+the `pulsar` display list) are compiled up front at startup and re-built on
+window resize, so a mid-run `1`/`2`/`3`/`4` scene switch never stalls the
+swap loop — a lazy first build de-phases the shutter packets and shows a
+wrong-eye/wrong-depth flash (e.g. the RDS square fusing behind the screen)
+until the stream re-locks.
 
 Emitter packet timing: the windowed path (vblank method 1) paces each eye
 packet against the boundary where the frame will *actually* appear. After
@@ -65,7 +72,15 @@ jitter-safe setting.
 Common keys (all scenes): `Esc`/`q` quit, `c` camera type, `f` force eye,
 `s` screenshot, `,`/`.`/`[`/`]` shutter phase, `i` eye swap,
 `o` cycle sync anchor display (multi-monitor fallback), `1`/`2`/`3`/`4`
-scene switch.
+scene switch. On the medimg RDS scene, `+`/`-` move the square's pop-out
+closer/further and `a`/`d` push the background's convergence.
+
+The default hexagon/triangle scene labels each eye's frame on screen, in
+that eye's own colour: the left lens should show `LEFT: GREEN HEXAGONS`,
+the right lens `RIGHT: BLUE TRIANGLES`. The alternating red/blue sync
+checker labels itself the same way, in white text: left lens `LEFT: RED`,
+right lens `RIGHT: BLUE`. If a lens shows the other pattern or colour
+(wrong label or wrong eye), the eyes are swapped — press `i`.
 
 On a single monitor the sync anchor picks the right head automatically. With
 several monitors on one GPU it binds to the one showing the window; if the
@@ -183,4 +198,5 @@ prints config plus any pending eye-swaps. `cargo test` exercises the ring
 - `src/host.rs` — host-helper logic (`host::run`)
 - `src/bin/3dv3d.rs`, `src/bin/nvstereo3d-host.rs` — thin `main` entries
 - `src/scene.rs`, `src/pulsar.rs`, `src/medimg.rs` — demo scenes
+- `src/text.rs` — 5x7 bitmap-font overlay (scene labels)
 - `firmware/nvstusb.fw` — emitter firmware image, embedded at build time

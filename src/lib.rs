@@ -82,6 +82,9 @@ pub mod gl {
         pub fn pixel_storei(&self, pname: types::GLenum, param: i32) {
             unsafe { self.PixelStorei(pname, param) }
         }
+        pub fn blend_func(&self, sfactor: types::GLenum, dfactor: types::GLenum) {
+            unsafe { self.BlendFunc(sfactor, dfactor) }
+        }
         pub fn read_buffer(&self, mode: types::GLenum) {
             unsafe { self.ReadBuffer(mode) }
         }
@@ -181,6 +184,7 @@ mod pulsar;
 mod scene;
 mod screenshot;
 mod stereo_helper;
+mod text;
 
 /// Shared-memory ring coupling the `nvstereo3d-host` helper to wiz3D's
 /// `Nvidia3DOutput.dll` (see [`host`]).
@@ -248,9 +252,9 @@ pub fn run_demo() {
 }
 
 /// Selectable scene. `Default` is the original 3dvgl per-eye diagnostic
-/// pattern (hexagons / triangles); key "2" switches to the 3dvgl-c "pulsar";
-/// key "3" to the medimg random-dot stereogram; key "4" to the alternating
-/// blue/red frame sync checker.
+/// pattern (hexagons / triangles); key "2" switches to the medimg
+/// random-dot stereogram; key "3" to the alternating blue/red frame sync
+/// checker; key "4" to the 3dvgl-c "pulsar".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SceneMode {
     HexTri,
@@ -279,8 +283,9 @@ struct App {
     current_eye: i32,
     rds_depth: i32,
     rds_bg: i32,
-    /// Currently active scene: "1" hexagons/triangles, "2" 3dvgl-c pulsar,
-    /// "3" medimg RDS. Defaults to the 3dvgl diagnostic pattern.
+    /// Currently active scene: "1" hexagons/triangles, "2" medimg RDS,
+    /// "3" alternating blue/red sync checker, "4" 3dvgl-c pulsar.
+    /// Defaults to the 3dvgl diagnostic pattern.
     scene: SceneMode,
     /// Pulsar spin angle (accumulated when `pulsar_rotate` is on).
     pulsar_angle: f32,
@@ -539,7 +544,15 @@ impl App {
         // emitter's kernel vblank anchor follows it across monitors (a
         // windowed window can be dragged; a fullscreen one can be moved with
         // compositor keybinds). Cheap: two winit lookups, no syscalls.
-        if self.frame_accum.count % 120 == 0 {
+        // Before the first output is known, poll every frame (bounded by the
+        // same grace period the emitter's anchor waits before falling back to
+        // a blind first-head scan): the method-1 vblank anchor now refuses to
+        // arm blindly on the first active head, so learning the output early
+        // is what lets it bind to the RIGHT head (and skip the startup
+        // re-target that read as an eye switch).
+        let boot_poll = self.last_monitor_name.is_none()
+            && self.frame_accum.count < crate::nvstusb::ARM_GRACE_SWAPS;
+        if boot_poll || self.frame_accum.count % 120 == 0 {
             if let Some(w) = self.window.as_ref() {
                 let mon = w.current_monitor();
                 let name = mon.as_ref().and_then(|m| m.name());
@@ -872,8 +885,22 @@ impl App {
 
 /// Draws the frame for the given eye (1 = left, 0 = right). `eye` is the eye
 /// actually projected once `force_eye` is applied. Dispatches to whichever of
-/// the three merged scenes is active (`scene`): the 3dvgl diagnostic pattern,
-/// the 3dvgl-c pulsar, or the medimg random-dot stereogram.
+/// the four merged scenes is active (`scene`): the 3dvgl diagnostic pattern,
+/// the medimg random-dot stereogram, the alternating blue/red sync checker,
+/// or the 3dvgl-c pulsar.
+
+/// Lifts the on-screen eye labels this far up from the bottom edge of the
+/// panel, in physical centimetres. Converted to pixels from the assumed
+/// panel height `SCREEN_HEIGHT_CM` (a 27" 16:9 monitor - the usual
+/// 2560x1440 120 Hz panel - is ~33.6 cm tall), scaling with the framebuffer
+/// height so the offset tracks the window's resolution. Adjust
+/// `SCREEN_HEIGHT_CM` if the actual monitor's diagonal differs.
+const LABEL_LIFT_CM: f64 = 3.0;
+/// Assumed physical height of the display, for the cm -> px label lift.
+const SCREEN_HEIGHT_CM: f64 = 33.6;
+/// Base y (pixels from the bottom scanline) where the labels used to sit.
+const LABEL_BASE_Y: i32 = 32;
+
 #[allow(clippy::too_many_arguments)]
 fn draw(
     gl: &Gl,
@@ -892,6 +919,11 @@ fn draw(
     gl.clear_color(0.0, 0.0, 0.0, 1.0);
     gl.clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
 
+    // The label baseline y, raised the requested 2 cm above the original
+    // position (glDrawPixels y counts upward from the bottom scanline).
+    let label_y = LABEL_BASE_Y
+        + ((gh as f64) * LABEL_LIFT_CM / SCREEN_HEIGHT_CM).round() as i32;
+
     let show = match force_eye {
         0 => eye,
         1 => 1,
@@ -899,14 +931,26 @@ fn draw(
     };
 
     match scene {
-        // The medimg RDS scene draws directly to the framebuffer via
-        // glDrawPixels; it needs no camera projection.
+        // The medimg RDS scene draws straight to the framebuffer via a
+        // full-screen textured quad; it needs no camera projection.
         SceneMode::Rds => medimg::draw_rds(gl, gw, gh, show, depth, bg),
         // 3dvgl diagnostic pattern (hexagons / triangles).
         SceneMode::HexTri => {
             stereo_helper::project_camera(gl, cam, gw as f32 / gh as f32, show);
             scene::make_lighting(gl);
             scene::make_geometry(gl, cam, show);
+            // Label which lens should see which pattern, in that eye's own
+            // scene colour. Each eye's frame is labelled for itself, so
+            // through the shutters the mapping - and any L/R inversion - is
+            // easy to read off the screen.
+            let (label, (tr, tg, tb)) = if show != 0 {
+                ("LEFT: GREEN HEXAGONS", (0.0f32, 0.9f32, 0.1f32))
+            } else {
+                ("RIGHT: BLUE TRIANGLES", (0.2f32, 0.45f32, 1.0f32))
+            };
+            let scale = (gw / 640).clamp(2, 6);
+            let w = label.len() as i32 * 6 * scale;
+            text::draw_text(gl, gw, gh, label, (gw - w) / 2, label_y, scale, tr, tg, tb);
         }
         // 3dvgl-c "pulsar".
         SceneMode::Pulsar => {
@@ -914,13 +958,21 @@ fn draw(
             pulsar::make_lighting(gl);
             pulsar::make_geometry(gl, angle);
         }
-        // Alternating blue/red frames for checking L/R sync: the whole
+        // Alternating red/blue frames for checking L/R sync: the whole
         // framebuffer is one solid color per eye, so any phase slip or eye
         // swap shows up immediately as a colour cast through the shutter.
+        // Red is the LEFT eye and blue the RIGHT eye.
         SceneMode::AltBlink => {
-            let (r, g, b) = if show != 0 { (0.0, 0.0, 1.0) } else { (1.0, 0.0, 0.0) };
+            let (r, g, b) = if show != 0 { (1.0, 0.0, 0.0) } else { (0.0, 0.0, 1.0) };
             gl.clear_color(r, g, b, 1.0);
             gl.clear(gl::COLOR_BUFFER_BIT);
+            // Label which lens should see which colour. White text: drawn in
+            // the frame's own colour, the label would vanish into the solid
+            // background.
+            let label = if show != 0 { "LEFT: RED" } else { "RIGHT: BLUE" };
+            let scale = (gw / 640).clamp(2, 6);
+            let w = label.len() as i32 * 6 * scale;
+            text::draw_text(gl, gw, gh, label, (gw - w) / 2, label_y, scale, 1.0, 1.0, 1.0);
         }
     }
 }
@@ -1160,6 +1212,18 @@ impl ApplicationHandler for App {
         self.gw = inner.width as i32;
         self.gh = inner.height as i32;
 
+        // Warm the one-shot scene assets (medimg's base-dot texture, pulsar's
+        // display list) while nothing is being paced yet. Building them lazily
+        // at a mid-run scene switch stalls the swap loop for ~100 ms in a debug
+        // build (~seconds at 2560x1440) and de-phases the shutter packets,
+        // which shows as a wrong-eye / wrong-depth flash after switching to
+        // scene 2 until the stream re-locks. The KMS path warms for exactly
+        // this reason (`run_kms`), but the windowed path had no equivalent.
+        if let Some(gl) = self.gl.as_ref() {
+            medimg::warm(gl, self.gw, self.gh);
+            pulsar::warm(gl);
+        }
+
         // Arm OML present feedback (vblank method 1) with the real Xlib
         // display + drawable backing the GL surface, so eye packets follow
         // actual on-screen presents - required on a composited desktop,
@@ -1287,6 +1351,13 @@ impl ApplicationHandler for App {
                     let height = NonZeroU32::new(size.height.max(1)).unwrap();
                     surface.resize(context, width, height);
                     gl.viewport(0, 0, size.width as i32, size.height as i32);
+                    // Re-warm the RDS base field at the new size while outside
+                    // the swap loop. `rds_texture` rebuilds lazily on the first
+                    // draw after a size change; doing that inside the live swap
+                    // loop de-phases the shutter packets on scene switch (see
+                    // the KMS warm comment). No-op when the cached texture
+                    // already matches this size.
+                    medimg::warm(gl, size.width.max(1) as i32, size.height.max(1) as i32);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1345,7 +1416,7 @@ impl Drop for DrEnvGuard {
 
 /// Direct-KMS frame pump. Renders straight to the display engine via GBM/EGL
 /// and DRM page flips, so the present vblank is the vblank we predicted. Keys
-/// are read from the controlling tty (raw mode); `,`/`.`/`[`/`]`/`p`/`g`
+/// are read from the controlling tty (raw mode); `,`/`.`/`[`/`]`
 /// adjust shutter sync live, `q` quits.
 fn run_kms(no_emitter: bool) -> Result<(), String> {
     if no_emitter {

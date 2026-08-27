@@ -163,7 +163,7 @@ fn draw_shifted_quad(
 /// on scene switch would stall the KMS render loop for ~100 ms in a debug
 /// build (3.7 M dot RNG), which permanently de-phases the strict VT flip clock
 /// (the shutters keep missing a vblank every ~9th frame). Warms before the
-/// loop so a switch to scene 3 is instant.
+/// loop so a switch to scene 2 is instant.
 pub fn warm(gl: &gl::Gl, gw: i32, gh: i32) {
     let _ = rds_texture(gl, gw, gh);
 }
@@ -184,11 +184,15 @@ pub fn draw_rds(gl: &gl::Gl, gw: i32, gh: i32, eye: i32, depth: i32, bg: i32) {
     // Square sits in the centre of the screen.
     let (cx, cy) = (gw / 2, gh / 2);
 
-    // Whole field gets the small mirrored background shift (into the screen)
-    // so it flickers uniformly - hiding the square without glasses - and the
-    // square pops out on the near side.
-    let sh_bg = if eye == 1 { -bg } else { bg };
-    let sh_sq = if eye == 1 { depth } else { -depth };
+    // A positive `sh` slides field content LEFT on screen (framebuffer column
+    // `x` samples texel `x + sh`). To make the square fuse IN FRONT of the
+    // screen its image must be crossed: shifted RIGHT for the LEFT eye and
+    // LEFT for the RIGHT eye. The background gets the mirrored shifts so it
+    // fuses INTO the screen, on the far side of the square (the whole field
+    // still flickers uniformly, which is what hides the square without
+    // glasses).
+    let sh_bg = if eye == 1 { bg } else { -bg };
+    let sh_sq = if eye == 1 { -depth } else { depth };
 
     // 2D orthographic projection covering the whole framebuffer.
     gl.matrix_mode(gl::PROJECTION);
