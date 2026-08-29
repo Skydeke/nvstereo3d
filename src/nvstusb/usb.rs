@@ -163,6 +163,32 @@ fn env_hex_id(name: &str) -> Option<u16> {
     u16::from_str_radix(raw, 16).ok()
 }
 
+/// Parses a 32-byte timing-register read-back response into `[w, x, y, z]`
+/// reload counts, or `None` when the shape is wrong.
+///
+/// Layout (see [`timings_block`]): 4 header bytes `[offset 0x00, amount 0x1c,
+/// 0x00, 0x04]`, then the 28-byte register block — w @ 4, x @ 8, y @ 12,
+/// eye/port-B toggles @ 16, and the **z frame-time reload at response offset
+/// 24** (data offset 20 of the 24-byte timing block; bytes 28..32 are only
+/// padding next to the block).
+fn parse_timings_response(resp: &[u8]) -> Option<[i32; 4]> {
+    if resp.len() < 32
+        || resp[0] != 0x00
+        || resp[1] != 0x1c
+        || resp[2] != 0x00
+        || resp[3] != 0x04
+    {
+        return None;
+    }
+    let rd = |i: usize| {
+        resp[i] as i32
+            | (resp[i + 1] as i32) << 8
+            | (resp[i + 2] as i32) << 16
+            | (resp[i + 3] as i32) << 24
+    };
+    Some([rd(4), rd(8), rd(12), rd(24)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +211,43 @@ mod tests {
         let mut pids = NVIDIA_ALT_PIDS;
         pids.sort_by_key(|p| NVIDIA_ALT_PIDS.iter().position(|a| a == p).unwrap_or(usize::MAX));
         assert_eq!(pids, NVIDIA_ALT_PIDS);
+    }
+
+    /// The Z frame-time reload lives at block data offset 20 (response offset
+    /// 24).  A parser that reads `resp[28]` silently reports z=0 from the
+    /// padding — the exact lie this regression test guards against.
+    #[test]
+    fn parse_timings_response_reads_z_from_block_offset() {
+        let w = t2_count(4735.58);
+        let x = t0_count(0.5);
+        let y = t0_count(7334.0);
+        let z = t2_count(1e6 / 120.0);
+
+        let mut resp = [0u8; 32];
+        resp[0..4].copy_from_slice(&[0x00, 0x1c, 0x00, 0x04]);
+        resp[4..8].copy_from_slice(&w.to_le_bytes());
+        resp[8..12].copy_from_slice(&x.to_le_bytes());
+        resp[12..16].copy_from_slice(&y.to_le_bytes());
+        resp[16..24].copy_from_slice(&[0x30, 0x28, 0x24, 0x22, 0x0a, 0x08, 0x05, 0x04]);
+        resp[24..28].copy_from_slice(&z.to_le_bytes());
+        // Padding after the block must not be read as z.
+        resp[28..32].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        assert_eq!(parse_timings_response(&resp), Some([w, x, y, z]));
+    }
+
+    /// Short reads (e.g. a leftover 7-byte button/keys echo from an earlier
+    /// session) and responses whose header does not match the timing block
+    /// must be rejected, not misparsed.
+    #[test]
+    fn parse_timings_response_rejects_short_and_foreign() {
+        let stale_keys = [0x18, 0x03, 0x00, 0x04, 0x00, 0x00, 0x00];
+        assert_eq!(parse_timings_response(&stale_keys), None);
+
+        let mut foreign = [0u8; 32];
+        foreign[0..4].copy_from_slice(&[0x18, 0x03, 0x00, 0x04]); // keys offset
+        foreign[4..8].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(parse_timings_response(&foreign), None);
     }
 }
 
@@ -401,31 +464,48 @@ fn set_up_interface(handle: &DeviceHandle<Context>) {
     }
 }
 
+/// Serializes the emitter's 28-byte shutter-timing register block written to
+/// 0x2007 — the same bytes the NVIDIA Windows driver programs per monitor
+/// (see 3DVisionActivator's `MonitorTimings.ini` and NV3D-Lib's
+/// `nvtimings.json`).
+///
+/// X = delay from monitor refresh start to the shutter open edge (us, T0
+/// reload), Y = shutter open window (us, T0 reload), W = second T2 timer
+/// counter (us; stored per monitor, rarely needs tuning); Z = frame time
+/// (us), derived from the refresh rate, the T2 frame-period reload.
+///
+/// Byte 0 of the payload is w, then x, then y, then the eye/port-B toggle
+/// tables, then z at payload offset 20 — the same layout the RP2040 clone
+/// implements and the read-back echoes verbatim.
+pub fn timings_block(rate: f32, x_us: f64, y_us: f64, w_us: f64) -> [u8; 28] {
+    let rate = if rate > 60.0 { rate as f64 } else { 120.0 };
+    let w = t2_count(w_us);
+    let x = t0_count(x_us);
+    let y = t0_count(y_us);
+    let z = t2_count(1e6 / rate);
+    [
+        0x01, 0x00, 0x18, 0x00, // write 24 bytes to 0x2007
+        w as u8, (w >> 8) as u8, (w >> 16) as u8, (w >> 24) as u8,
+        x as u8, (x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8,
+        y as u8, (y >> 8) as u8, (y >> 16) as u8, (y >> 24) as u8,
+        0x30, // 2013: left eye off
+        0x28, // 2014: left eye on
+        0x24, // 2015: right eye off
+        0x22, // 2016: right eye on
+        0x0a, 0x08, 0x05, 0x04, // Port B toggle bits
+        z as u8, (z >> 8) as u8, (z >> 16) as u8, (z >> 24) as u8, // T2 frame-time reload
+    ]
+}
+
 impl UsbDevice {
     /// Configures the emitter for the given refresh rate and enables driver
-    /// mode.  Exact byte stream from 3dv3d's `NvstusbContext::set_rate`.
+    /// mode.  Exact byte stream from 3dv3d's `NvstusbContext::set_rate`, with
+    /// the reference 1440p @ 120 Hz shutter timings (X=0.5us, Y=7334.0us,
+    /// W=4735.58us) and Z taken from the refresh rate.  `configure` owns the
+    /// 0x1c / timeout / driver-enable registers; use [`Self::set_timings_us`]
+    /// to reprogram only the shutter timings live afterwards.
     pub fn configure(&self, rate: f32) -> Result<(), String> {
-        // Shutter timings for a 2560x1440 @ 120 Hz panel from the NV3D-Lib
-        // nvtimings.json reference: X=0.5us (refresh-start->open),
-        // Y=7334.0us (open), Z=8333.5us (frame time), W=4735.58us.
-        let w = t2_count(4735.58);
-        let x = t0_count(0.5);
-        let y = t0_count(7334.0);
-        let z = t2_count(8333.5);
-
-        let cmd_timings: [u8; 28] = [
-            0x01, 0x00, 0x18, 0x00, // write 24 bytes to 0x2007
-            w as u8, (w >> 8) as u8, (w >> 16) as u8, (w >> 24) as u8,
-            x as u8, (x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8,
-            y as u8, (y >> 8) as u8, (y >> 16) as u8, (y >> 24) as u8,
-            0x30, // 2013: left eye off
-            0x28, // 2014: left eye on
-            0x24, // 2015: right eye off
-            0x22, // 2016: right eye on
-            0x0a, 0x08, 0x05, 0x04, // Port B toggle bits
-            z as u8, (z >> 8) as u8, (z >> 16) as u8, (z >> 24) as u8, // T2 reload
-        ];
-        self.write_bulk(2, &cmd_timings)
+        self.write_bulk(2, &timings_block(rate, 0.5, 7334.0, 4735.58))
             .map_err(|e| format!("timings write failed: {e}"))?;
 
         let cmd_0x1c: [u8; 6] = [0x01, 0x1c, 0x02, 0x00, 0x02, 0x00];
@@ -444,6 +524,59 @@ impl UsbDevice {
 
         eprintln!("nvstusb: emitter configured at {rate:.1} Hz (driver mode)");
         Ok(())
+    }
+
+    /// Reprograms only the shutter-timing registers (X/Y/W, microseconds)
+    /// live.  This is the 3DVisionActivator / NV3D-Lib per-monitor tuning
+    /// step: X = delay from monitor refresh start to the shutter open edge,
+    /// Y = shutter open window, W = second T2 timer counter (stored per
+    /// monitor, rarely needs tuning).  `configure` must have run once first
+    /// (it owns the 0x1c / timeout / driver-enable registers, which are
+    /// unaffected by re-tuning).  Z (frame time) always follows the configured
+    /// refresh rate.  Whether a given emitter actually drives the shutters
+    /// from these registers is verified by [`Self::read_timings_registers`]
+    /// (see `NvstusbContext::probe_timings_live`).
+    pub fn set_timings_us(&self, rate: f32, x_us: f64, y_us: f64, w_us: f64) -> Result<(), String> {
+        self.write_bulk(2, &timings_block(rate, x_us, y_us, w_us))
+            .map_err(|e| format!("shutter timing write failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Reads the 0x2007 shutter-timing register block back from the emitter —
+    /// the same write-back verification 3DVisionActivator performs after every
+    /// `refresh()`.  Returns the four stored timer reload values as `[w, x, y,
+    /// z]` (T2/T0/T0/T2 counts) when the device answers with the expected
+    /// 32-byte status response (4 header bytes + the 28-byte register block).
+    ///
+    /// Echo layout (the 24-byte timing block written by [`timings_block`],
+    /// padded to 28 bytes): w @ 4, x @ 8, y @ 12, eye/port-B toggles @ 16,
+    /// z @ 24 — the frame-time reload is at response offset **24**, not 28,
+    /// which is only padding after the block (3DVisionActivator's `resp[28]`
+    /// read hits that padding; `z` is at `resp[24]`).
+    ///
+    /// A device can answer with a *stale* control-in response first — e.g. a
+    /// leftover 7-byte button/keys echo from a previous host session that
+    /// exited without reading it — so the read is retried and any response
+    /// whose header does not match the expected `[offset 0x00, amount 0x1c,
+    /// 0x00, 0x04]` shape is consumed and discarded rather than misread as
+    /// the timing block.
+    pub fn read_timings_registers(&self) -> Option<[i32; 4]> {
+        // Plain read, 28 bytes from offset 0x2007 (0x02 = read command,
+        // then the 0x2007 offset and 0x001c = 28 data bytes).
+        let cmd: [u8; 4] = [0x02, 0x00, 0x1c, 0x00];
+        for _ in 0..3 {
+            self.write_bulk(2, &cmd).ok()?;
+            let mut resp = [0u8; 32];
+            let Ok(n) = self.read_bulk(4, &mut resp) else {
+                continue; // timeout / bus error: nothing read; re-issue
+            };
+            if let Some(vals) = parse_timings_response(&resp[..n]) {
+                return Some(vals);
+            }
+            // Short, ill-shaped, or stale response (e.g. a leftover keys echo
+            // from a previous host session): the read consumed it; re-issue.
+        }
+        None
     }
 
     /// Sets the RP2040 clone's packet -> IR delay (control register 0x23),

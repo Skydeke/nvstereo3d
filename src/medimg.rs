@@ -16,13 +16,17 @@
 //! the eye's disparity, plus a second quad for the central square. The shift -
 //! which is a pure column offset - is done entirely on the GPU by sampling the
 //! nearest texel at an offset coordinate, so a frame costs no per-pixel CPU
-//! work and no pixel upload. That keeps every frame comfortably inside one
-//! 120 Hz vblank (the old per-frame `glDrawPixels` of the whole 2560x1440 field
-//! pushed the swap over the 8333 us budget and dropped the shutter sync).
+//! work and no pixel upload. The quads go through the shared textured shader
+//! (see [`crate::gfx`]) instead of fixed-function texture mapping, and the
+//! tiny per-frame vertex updates reuse one cached VBO. That keeps every frame
+//! comfortably inside one 120 Hz vblank (the old per-frame `glDrawPixels` of
+//! the whole 2560x1440 field pushed the swap over the 8333 us budget and
+//! dropped the shutter sync).
 
 use crate::gl;
+use crate::gfx::{self, Mesh, Texture, UvVert};
+use glam::Mat4;
 use std::cell::RefCell;
-use std::ffi::c_void;
 
 /// Fixed seed so every frame (both eyes) renders the same dot pattern - the
 /// essential correlation that creates the stereo depth.
@@ -50,7 +54,11 @@ const LUM_BLACK: u8 = 32;
 // The base dot field lives as a GL texture, `(w, h, texture)`; rebuilt only
 // when the surface size changes, so no per-frame allocation or upload happens.
 thread_local! {
-    static RDS_TEX: RefCell<Option<(i32, i32, u32)>> = const { RefCell::new(None) };
+    static RDS_TEX: RefCell<Option<(i32, i32, Texture)>> = const { RefCell::new(None) };
+    /// Reusable mesh holding the background + central-square quads; its
+    /// vertices are re-uploaded (orphaned) each frame, so no GL object is
+    /// created in the render loop.
+    static RDS_QUAD: RefCell<Option<Mesh>> = const { RefCell::new(None) };
 }
 
 /// Tiny xorshift RNG; no external `rand` crate needed.
@@ -82,57 +90,44 @@ fn base_noise(w: i32, h: i32) -> Vec<u8> {
 
 /// Returns the gamma-correct base field texture, rebuilding it (and re-drawing
 /// the dots) only when the surface size changes.
-fn rds_texture(gl: &gl::Gl, gw: i32, gh: i32) -> u32 {
-    let mut out = 0u32;
+fn rds_texture(gl: &gl::Gl, gw: i32, gh: i32) -> Texture {
     RDS_TEX.with(|c| {
         let mut c = c.borrow_mut();
         let rebuild = match &*c {
-            Some((w, h, id)) => *w != gw || *h != gh || *id == 0,
+            Some((w, h, tex)) => *w != gw || *h != gh || tex.is_none(),
             None => true,
         };
         if rebuild {
-            if let Some((_, _, id)) = c.as_ref() {
-                if *id != 0 {
-                    let mut arr = [*id];
-                    gl.delete_textures(1, &mut arr);
-                }
+            if let Some((_, _, tex)) = c.as_ref() {
+                tex.delete(gl);
             }
-            let mut id = 0u32;
-            gl.gen_textures(1, std::slice::from_mut(&mut id));
-            if id != 0 {
-                let base = base_noise(gw, gh);
-                gl.bind_texture(gl::TEXTURE_2D, id);
-                gl.pixel_storei(gl::UNPACK_ALIGNMENT, 1);
-                gl.tex_parameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
-                gl.tex_parameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
-                gl.tex_parameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT as i32);
-                gl.tex_parameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT as i32);
-                gl.tex_image_2d(
-                    gl::TEXTURE_2D,
-                    0,
-                    gl::LUMINANCE as i32,
-                    gw,
-                    gh,
-                    0,
-                    gl::LUMINANCE,
-                    gl::UNSIGNED_BYTE,
-                    base.as_ptr() as *const c_void,
-                );
-            }
-            *c = Some((gw, gh, id));
+            let base = base_noise(gw, gh);
+            let tex = Texture::new(
+                gl,
+                gw,
+                gh,
+                gl::LUMINANCE as i32,
+                gl::LUMINANCE,
+                gl::UNSIGNED_BYTE,
+                Some(&base),
+                gl::NEAREST as i32,
+                gl::REPEAT as i32,
+            );
+            *c = Some((gw, gh, tex));
         }
-        if let Some((_, _, id)) = c.as_ref() {
-            out = *id;
+        match c.as_ref() {
+            Some((_, _, tex)) => *tex,
+            None => Texture::none(),
         }
-    });
-    out
+    })
 }
 
-/// Draws one full-screen textured quad sampling the base field at a horizontal
-/// offset of `sh` pixels (wrapping), i.e. framebuffer column `x` shows texel
-/// `x + sh` - a pure left/right shift of the random field.
-fn draw_shifted_quad(
-    gl: &gl::Gl,
+/// Appends one full-screen textured quad sampling the base field at a
+/// horizontal offset of `sh` pixels (wrapping), i.e. framebuffer column `x`
+/// shows texel `x + sh` - a pure left/right shift of the random field.
+/// Builds two triangles (it was a single `GL_QUADS` in the old pipeline).
+fn push_shifted_quad(
+    verts: &mut Vec<UvVert>,
     gw: i32,
     gh: i32,
     x0: i32,
@@ -147,23 +142,19 @@ fn draw_shifted_quad(
     let s1 = (x1 as f32 + sh as f32) / gw as f32;
     let (v0, v1) = (y0 as f32 / gh as f32, y1 as f32 / gh as f32);
 
-    gl.begin(gl::QUADS);
-    gl.tex_coord2f(s0, v0);
-    gl.vertex2f(x0 as f32, y0 as f32);
-    gl.tex_coord2f(s0, v1);
-    gl.vertex2f(x0 as f32, y1 as f32);
-    gl.tex_coord2f(s1, v1);
-    gl.vertex2f(x1 as f32, y1 as f32);
-    gl.tex_coord2f(s1, v0);
-    gl.vertex2f(x1 as f32, y0 as f32);
-    gl.end();
+    let a = UvVert { pos: [x0 as f32, y0 as f32], uv: [s0, v0] };
+    let b = UvVert { pos: [x0 as f32, y1 as f32], uv: [s0, v1] };
+    let c = UvVert { pos: [x1 as f32, y1 as f32], uv: [s1, v1] };
+    let d = UvVert { pos: [x1 as f32, y0 as f32], uv: [s1, v0] };
+    // GL_QUADS triangulation: (a, b, c), (a, c, d).
+    verts.extend_from_slice(&[a, b, c, a, c, d]);
 }
 
-/// Compiles the base-field texture up front (no drawing). Building it lazily
-/// on scene switch would stall the KMS render loop for ~100 ms in a debug
-/// build (3.7 M dot RNG), which permanently de-phases the strict VT flip clock
-/// (the shutters keep missing a vblank every ~9th frame). Warms before the
-/// loop so a switch to scene 2 is instant.
+/// Compiles the base-field texture up front (no drawing) for both eye aspect
+/// variants. Building it lazily on a scene switch would stall the swap loop
+/// for ~100 ms in a debug build (a 3.7 M-dot RNG), which permanently
+/// de-phases the shutters (they keep missing a vblank every ~9th frame).
+/// Warms before the loop so a switch to scene 2 is instant.
 pub fn warm(gl: &gl::Gl, gw: i32, gh: i32) {
     let _ = rds_texture(gl, gw, gh);
 }
@@ -176,10 +167,15 @@ pub fn warm(gl: &gl::Gl, gw: i32, gh: i32) {
 /// square the other makes the background-vs-front gap obvious while each stays
 /// small enough to fuse.
 pub fn draw_rds(gl: &gl::Gl, gw: i32, gh: i32, eye: i32, depth: i32, bg: i32) {
-    let id = rds_texture(gl, gw, gh);
-    if id == 0 {
+    let tex = rds_texture(gl, gw, gh);
+    if tex.is_none() {
         return;
     }
+
+    // The scene draws over the whole framebuffer at z=0; the depth-test bit is
+    // globally enabled (geometry scenes), so it is turned off here and restored
+    // after, exactly like the original draw_rds did.
+    gfx::disable(gl, gl::DEPTH_TEST);
 
     // Square sits in the centre of the screen.
     let (cx, cy) = (gw / 2, gh / 2);
@@ -194,24 +190,12 @@ pub fn draw_rds(gl: &gl::Gl, gw: i32, gh: i32, eye: i32, depth: i32, bg: i32) {
     let sh_bg = if eye == 1 { bg } else { -bg };
     let sh_sq = if eye == 1 { -depth } else { depth };
 
-    // 2D orthographic projection covering the whole framebuffer.
-    gl.matrix_mode(gl::PROJECTION);
-    gl.load_identity();
-    gl.ortho(0.0, gw as f64, 0.0, gh as f64, -1.0, 1.0);
-    gl.matrix_mode(gl::MODELVIEW);
-    gl.load_identity();
-
-    gl.disable(gl::LIGHTING);
-    gl.disable(gl::DEPTH_TEST);
-    gl.tex_envi(gl::TEXTURE_ENV, gl::TEXTURE_ENV_MODE, gl::REPLACE as i32);
-    gl.bind_texture(gl::TEXTURE_2D, id);
-    gl.enable(gl::TEXTURE_2D);
-
     // Background: the whole field shifted by the convergence, then the central
     // square re-drawn with its own extra offset on top.
-    draw_shifted_quad(gl, gw, gh, 0, 0, gw, gh, sh_bg);
-    draw_shifted_quad(
-        gl,
+    let mut verts: Vec<UvVert> = Vec::with_capacity(12);
+    push_shifted_quad(&mut verts, gw, gh, 0, 0, gw, gh, sh_bg);
+    push_shifted_quad(
+        &mut verts,
         gw,
         gh,
         cx - SQUARE_HALF,
@@ -221,6 +205,19 @@ pub fn draw_rds(gl: &gl::Gl, gw: i32, gh: i32, eye: i32, depth: i32, bg: i32) {
         sh_sq,
     );
 
-    gl.disable(gl::TEXTURE_2D);
-    gl.enable(gl::DEPTH_TEST);
+    // 2D orthographic projection covering the whole framebuffer (the same
+    // 0..gw / 0..gh box `glOrtho` set up before).
+    let mvp = Mat4::orthographic_rh_gl(0.0, gw as f32, 0.0, gh as f32, -1.0, 1.0);
+
+    RDS_QUAD.with(|q| {
+        let mut q = q.borrow_mut();
+        match q.as_mut() {
+            Some(m) => m.replace_uv_verts(gl, &verts),
+            None => *q = Some(Mesh::from_uv_verts(gl, &verts, gl::TRIANGLES)),
+        };
+        if let Some(m) = q.as_ref() {
+            tex.draw(gl, m, mvp, gfx::WHITE);
+        }
+    });
+    gfx::enable(gl, gl::DEPTH_TEST);
 }

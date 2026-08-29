@@ -19,20 +19,21 @@ fn main() {
     let eyes = s.drain();
     let names: Vec<&str> = eyes
         .iter()
-        .map(|&e| match e {
+        .map(|e| match e.eye {
             shm::EYE_LEFT => "L",
             shm::EYE_RIGHT => "R",
             _ => "?",
         })
         .collect();
     println!(
-        "rate={} alarm={}us status={} flags={:#x} ring_head={} ring_tail={} drained=[{}]",
+        "rate={} alarm={}us status={} flags={:#x} ring_head={} ring_tail={} connector={:?} drained=[{}]",
         s.rate_hz(),
         s.alarm_delay_us(),
         s.status.load(Ordering::Relaxed),
         s.flags.load(Ordering::Relaxed),
         s.head.load(Ordering::Relaxed),
         s.tail.load(Ordering::Relaxed),
+        s.connector_name(),
         names.join(",")
     );
 }

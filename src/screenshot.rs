@@ -1,33 +1,32 @@
 //! Frame buffer screenshots in 24-bit uncompressed TGA format.
 //!
-//! Port of `src/screenshot.cpp` from the original C project.
+//! Port of `src/screenshot.cpp` from the original C project, reimplemented on
+//! the `glow` API.
 
-use crate::gl;
+use crate::gl::{self, HasContext};
 use std::io::Write;
 
 /// Configures OpenGL pixel-store state so screenshots read correctly.
 pub fn init(gl: &gl::Gl) {
-    gl.pixel_storei(gl::PACK_ALIGNMENT, 1);
-    gl.pixel_storei(gl::UNPACK_ALIGNMENT, 1);
+    unsafe {
+        gl.pixel_store_i32(gl::PACK_ALIGNMENT, 1);
+        gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, 1);
+    }
 }
 
 /// Reads the region `(x, y)` to `(x + w, y + h)` from the front buffer and
 /// writes it to `filename` as a 24-bit uncompressed TGA file.
 pub fn screenshot(gl: &gl::Gl, x: i32, y: i32, w: i32, h: i32, filename: &str) {
+    use gl::PixelPackData;
+
     // Read from the front buffer.
-    gl.read_buffer(gl::FRONT);
+    unsafe { gl.read_buffer(gl::FRONT) };
 
     // Grab the pixel data.
     let mut buffer = vec![0u8; (w * h * 3) as usize];
-    gl.read_pixels(
-        x,
-        y,
-        w,
-        h,
-        gl::RGB,
-        gl::UNSIGNED_BYTE,
-        buffer.as_mut_ptr() as *mut std::ffi::c_void,
-    );
+    unsafe {
+        gl.read_pixels(x, y, w, h, gl::RGB, gl::UNSIGNED_BYTE, PixelPackData::Slice(Some(&mut buffer)));
+    }
 
     let mut file = match std::fs::File::create(filename) {
         Ok(file) => file,

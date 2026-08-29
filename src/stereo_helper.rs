@@ -1,55 +1,18 @@
 //! Stereo camera helpers: vector math, camera description and the
 //! projection/eye-position code, plus X11 refresh-rate detection.
 //!
-//! Port of `src/stereo_helper.h` from the original C project.
+//! Port of `src/stereo_helper.h` from the original C project. The vector and
+//! matrix math now come from `glam` (replacing the hand-rolled `Vec3` and the
+//! GL matrix-stack replication of `gluPerspective`/`gluLookAt`); the matrices
+//! are built exactly as the GLU originals did, so the eye projection is
+//! bit-for-bit the same as before.
 
-use crate::gl;
+pub use glam::Vec3;
+
 use crate::nvstusb::NvstusbContext;
+use glam::Mat4;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void};
-
-/// A simple 3D vector.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Vec3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl Vec3 {
-    pub fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-
-    pub fn add(self, rhs: Vec3) -> Vec3 {
-        Vec3::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
-    }
-
-    pub fn sub(self, rhs: Vec3) -> Vec3 {
-        Vec3::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
-    }
-
-    pub fn mul(self, rhs: f32) -> Vec3 {
-        Vec3::new(self.x * rhs, self.y * rhs, self.z * rhs)
-    }
-
-    pub fn div(self, rhs: f32) -> Vec3 {
-        Vec3::new(self.x / rhs, self.y / rhs, self.z / rhs)
-    }
-
-    pub fn normalize(&self) -> Vec3 {
-        let norm = (self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
-        self.div(norm)
-    }
-
-    pub fn cross(&self, rhs: Vec3) -> Vec3 {
-        Vec3::new(
-            self.y * rhs.z - rhs.y * self.z,
-            self.z * rhs.x - rhs.z * self.x,
-            self.x * rhs.y - rhs.x * self.y,
-        )
-    }
-}
 
 /// The different ways of projecting a stereo pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,11 +206,10 @@ pub fn config_refresh_rate(ctx: &mut NvstusbContext, preferred_mhz: Option<u32>)
     }
 }
 
-/// GLU `gluPerspective`, expressed as a multiply on the current (projection)
-/// matrix, replicating the original's use of `gluPerspective`.
-fn glu_perspective(gl: &gl::Gl, fovy: f32, aspect: f32, z_near: f32, z_far: f32) {
+/// GLU `gluPerspective` as a matrix, replicating the original's call with the
+/// GLU implementation's exact values (column-major).
+fn glu_perspective(fovy: f32, aspect: f32, z_near: f32, z_far: f32) -> Mat4 {
     let f = 1.0 / (fovy / 2.0).to_radians().tan();
-    // Column-major, exactly like the GLU implementation.
     let m: [f32; 16] = [
         f / aspect,
         0.0,
@@ -266,13 +228,13 @@ fn glu_perspective(gl: &gl::Gl, fovy: f32, aspect: f32, z_near: f32, z_far: f32)
         (2.0 * z_far * z_near) / (z_near - z_far),
         0.0,
     ];
-    gl.mult_matrixf(&m);
+    Mat4::from_cols_array(&m)
 }
 
-/// GLU `gluLookAt`, expressed as a multiply on the current matrix, replicating
-/// the original's use of `gluLookAt`.
-fn glu_look_at(gl: &gl::Gl, eye: Vec3, center: Vec3, up: Vec3) {
-    let forward = center.sub(eye).normalize();
+/// GLU `gluLookAt` as a matrix, replicating the original's call with the GLU
+/// implementation's exact values (column-major).
+fn glu_look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
+    let forward = (center - eye).normalize();
     let side = forward.cross(up).normalize();
     let up2 = side.cross(forward);
 
@@ -294,36 +256,35 @@ fn glu_look_at(gl: &gl::Gl, eye: Vec3, center: Vec3, up: Vec3) {
         forward.x * eye.x + forward.y * eye.y + forward.z * eye.z,
         1.0,
     ];
-    gl.mult_matrixf(&m);
+    Mat4::from_cols_array(&m)
 }
 
-/// Computes the camera transform for the given eye and applies it to the
-/// projection matrix. `eye` is `1` for left and `0` for right (matching the
-/// original). The modelview matrix is left selected afterwards.
-pub fn project_camera(gl: &gl::Gl, cam: Camera, aspect: f32, eye: i32) {
-    // Swap to the projection stack; the entire camera transform goes on it.
-    gl.matrix_mode(gl::PROJECTION);
-    gl.load_identity();
-
+/// The combined projection·view matrix for the given eye. `eye` is `1` for
+/// left and `0` for right (matching the original). This replaces the old GL
+/// matrix-stack fiddling (`glMatrixMode` + `gluPerspective`/`gluLookAt`/
+/// `glFrustum`): the matrices are built identically and multiplied in the
+/// same order, so `mvp * vertex` lands on exactly the NDC the old pipeline
+/// produced.
+pub fn project_mvp(cam: Camera, aspect: f32, eye: i32) -> Mat4 {
     // Camera basis.
-    let dir = cam.look.sub(cam.eye).normalize();
+    let dir = (cam.look - cam.eye).normalize();
     let right = dir.cross(cam.up).normalize();
 
     // Ocular shift based on which eye we're showing.
     let shift = if eye != 0 {
-        right.mul(cam.iod / 2.0).mul(-1.0) // left
+        right * (-(cam.iod / 2.0)) // left
     } else {
-        right.mul(cam.iod / 2.0) // right
+        right * (cam.iod / 2.0) // right
     };
 
     // The focal point is the focal distance along the view direction.
-    let focus = cam.eye.add(dir.mul(cam.focal));
+    let focus = cam.eye + dir * cam.focal;
 
-    match cam.camera_type {
+    let (projection, view_eye, view_center) = match cam.camera_type {
         CameraType::ToeIn => {
             // Traditional perspective frusta.
-            glu_perspective(gl, cam.fov, aspect, cam.near, cam.far);
-            glu_look_at(gl, cam.eye.add(shift), focus, cam.up);
+            let p = glu_perspective(cam.fov, aspect, cam.near, cam.far);
+            (p, cam.eye + shift, focus)
         }
         CameraType::ParallelAxisAsymmetric => {
             // Bounds of the asymmetric frustum.
@@ -336,14 +297,33 @@ pub fn project_camera(gl: &gl::Gl, cam: Camera, aspect: f32, eye: i32) {
             };
             let left = -right;
 
-            gl.frustum(left, right, bottom, top, cam.near, cam.far);
+            let m: [f32; 16] = [
+                2.0 * cam.near / (right - left),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                2.0 * cam.near / (top - bottom),
+                0.0,
+                0.0,
+                (right + left) / (right - left),
+                (top + bottom) / (top - bottom),
+                -(cam.far + cam.near) / (cam.far - cam.near),
+                -1.0,
+                0.0,
+                0.0,
+                -(2.0 * cam.far * cam.near) / (cam.far - cam.near),
+                0.0,
+            ];
+            let p = Mat4::from_cols_array(&m);
 
             // For the parallel axis camera both the eye and the focus are
             // shifted, keeping the camera direction axis parallel.
-            glu_look_at(gl, cam.eye.add(shift), focus.add(shift), cam.up);
+            (p, cam.eye + shift, focus + shift)
         }
-    }
+    };
 
-    // Back to the modelview stack.
-    gl.matrix_mode(gl::MODELVIEW);
+    // The old code post-multiplied the projection matrix (projection =
+    // projection * lookAt), so clip = projection * view * vertex.
+    projection * glu_look_at(view_eye, view_center, cam.up)
 }

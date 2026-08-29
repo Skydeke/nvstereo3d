@@ -3,7 +3,7 @@
 //! this helper (consumer) in production.  Exercises wrap-around, full-ring
 //! rejection, and config-field reads.
 
-use nvstereo3d::shm::{Shm, EYE_LEFT, EYE_RIGHT};
+use nvstereo3d::shm::{self, Shm, EYE_LEFT, EYE_RIGHT};
 
 fn temp_path(name: &str) -> String {
     format!(
@@ -30,7 +30,11 @@ fn ring_roundtrip_and_wraparound() {
     assert!(prod.enqueue(EYE_LEFT));
     assert!(prod.enqueue(EYE_RIGHT));
     assert!(prod.enqueue(EYE_LEFT));
-    assert_eq!(cons.drain(), vec![EYE_LEFT, EYE_RIGHT, EYE_LEFT]);
+    let drained: Vec<shm::Swap> = cons.drain();
+    assert_eq!(
+        drained.iter().map(|s| s.eye).collect::<Vec<_>>(),
+        vec![EYE_LEFT, EYE_RIGHT, EYE_LEFT]
+    );
     assert!(cons.drain().is_empty());
 
     // Wrap-around: push more than the capacity so indices exceed u32 mask.
@@ -49,7 +53,8 @@ fn ring_roundtrip_and_wraparound() {
 
     // A fresh enqueue after draining works again (indices wrapped).
     assert!(prod.enqueue(EYE_RIGHT));
-    assert_eq!(cons.drain(), vec![EYE_RIGHT]);
+    let drained: Vec<shm::Swap> = cons.drain();
+    assert_eq!(drained.iter().map(|s| s.eye).collect::<Vec<_>>(), vec![EYE_RIGHT]);
 
     std::fs::remove_file(&path).ok();
 }

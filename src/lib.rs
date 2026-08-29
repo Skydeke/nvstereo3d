@@ -5,181 +5,24 @@
 //! sync with the display, with GLUT replaced by winit + glutin.
 
 pub mod gl {
-    include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+    //! GL bindings for the demo.
+    //!
+    //! `glow`'s API is `unsafe`, so no scene code calls these entry points
+    //! directly: the safe wrappers in [`crate::gfx`] own every GL call. This
+    //! module only re-exports the `glow` context type and the GL constants.
 
-    // Safe, snake_case wrappers around the generated (unsafe, PascalCase)
-    // methods for the small subset of fixed-function OpenGL used by the demo.
-    impl Gl {
-        pub fn clear(&self, mask: types::GLbitfield) {
-            unsafe { self.Clear(mask) }
-        }
-        pub fn clear_color(&self, r: f32, g: f32, b: f32, a: f32) {
-            unsafe { self.ClearColor(r, g, b, a) }
-        }
-        pub fn enable(&self, cap: types::GLenum) {
-            unsafe { self.Enable(cap) }
-        }
-        pub fn disable(&self, cap: types::GLenum) {
-            unsafe { self.Disable(cap) }
-        }
-        pub fn depth_mask(&self, flag: bool) {
-            unsafe { self.DepthMask(flag as types::GLboolean) }
-        }
-        pub fn begin(&self, mode: types::GLenum) {
-            unsafe { self.Begin(mode) }
-        }
-        pub fn end(&self) {
-            unsafe { self.End() }
-        }
-        pub fn color3f(&self, r: f32, g: f32, b: f32) {
-            unsafe { self.Color3f(r, g, b) }
-        }
-        pub fn normal3f(&self, x: f32, y: f32, z: f32) {
-            unsafe { self.Normal3f(x, y, z) }
-        }
-        pub fn vertex3f(&self, x: f32, y: f32, z: f32) {
-            unsafe { self.Vertex3f(x, y, z) }
-        }
-        pub fn vertex3fv(&self, v: &[f32; 3]) {
-            unsafe { self.Vertex3fv(v.as_ptr()) }
-        }
-        pub fn push_matrix(&self) {
-            unsafe { self.PushMatrix() }
-        }
-        pub fn pop_matrix(&self) {
-            unsafe { self.PopMatrix() }
-        }
-        pub fn rotatef(&self, angle: f32, x: f32, y: f32, z: f32) {
-            unsafe { self.Rotatef(angle, x, y, z) }
-        }
-        pub fn materialfv(&self, face: types::GLenum, pname: types::GLenum, params: &[f32]) {
-            unsafe { self.Materialfv(face, pname, params.as_ptr()) }
-        }
-        pub fn shade_model(&self, mode: types::GLenum) {
-            unsafe { self.ShadeModel(mode) }
-        }
-        pub fn light_modeli(&self, pname: types::GLenum, param: i32) {
-            unsafe { self.LightModeli(pname, param) }
-        }
-        pub fn light_modelfv(&self, pname: types::GLenum, params: &[f32]) {
-            unsafe { self.LightModelfv(pname, params.as_ptr()) }
-        }
-        pub fn lightfv(&self, light: types::GLenum, pname: types::GLenum, params: &[f32]) {
-            unsafe { self.Lightfv(light, pname, params.as_ptr()) }
-        }
-        pub fn matrix_mode(&self, mode: types::GLenum) {
-            unsafe { self.MatrixMode(mode) }
-        }
-        pub fn load_identity(&self) {
-            unsafe { self.LoadIdentity() }
-        }
-        pub fn mult_matrixf(&self, m: &[f32]) {
-            unsafe { self.MultMatrixf(m.as_ptr()) }
-        }
-        pub fn frustum(&self, l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) {
-            unsafe { self.Frustum(l as f64, r as f64, b as f64, t as f64, n as f64, f as f64) }
-        }
-        pub fn pixel_storei(&self, pname: types::GLenum, param: i32) {
-            unsafe { self.PixelStorei(pname, param) }
-        }
-        pub fn blend_func(&self, sfactor: types::GLenum, dfactor: types::GLenum) {
-            unsafe { self.BlendFunc(sfactor, dfactor) }
-        }
-        pub fn read_buffer(&self, mode: types::GLenum) {
-            unsafe { self.ReadBuffer(mode) }
-        }
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        #[allow(clippy::too_many_arguments)]
-        pub fn read_pixels(
-            &self,
-            x: i32,
-            y: i32,
-            w: i32,
-            h: i32,
-            format: types::GLenum,
-            ty: types::GLenum,
-            pixels: *mut std::ffi::c_void,
-        ) {
-            unsafe { self.ReadPixels(x, y, w, h, format, ty, pixels) }
-        }
-        pub fn color_material(&self, face: types::GLenum, mode: types::GLenum) {
-            unsafe { self.ColorMaterial(face, mode) }
-        }
-        pub fn viewport(&self, x: i32, y: i32, w: i32, h: i32) {
-            unsafe { self.Viewport(x, y, w, h) }
-        }
-        pub fn ortho(&self, l: f64, r: f64, b: f64, t: f64, n: f64, f: f64) {
-            unsafe { self.Ortho(l, r, b, t, n, f) }
-        }
-        pub fn raster_pos2i(&self, x: i32, y: i32) {
-            unsafe { self.RasterPos2i(x, y) }
-        }
-        pub fn draw_pixels(
-            &self,
-            w: i32,
-            h: i32,
-            format: types::GLenum,
-            ty: types::GLenum,
-            data: *const std::ffi::c_void,
-        ) {
-            unsafe { self.DrawPixels(w, h, format, ty, data) }
-        }
-        pub fn gen_textures(&self, n: i32, textures: &mut [u32]) {
-            unsafe { self.GenTextures(n, textures.as_mut_ptr()) }
-        }
-        pub fn delete_textures(&self, n: i32, textures: &mut [u32]) {
-            unsafe { self.DeleteTextures(n, textures.as_mut_ptr()) }
-        }
-        pub fn gen_lists(&self, range: i32) -> u32 {
-            unsafe { self.GenLists(range) }
-        }
-        pub fn new_list(&self, list: u32, mode: types::GLenum) {
-            unsafe { self.NewList(list, mode) }
-        }
-        pub fn end_list(&self) {
-            unsafe { self.EndList() }
-        }
-        pub fn call_list(&self, list: u32) {
-            unsafe { self.CallList(list) }
-        }
-        pub fn bind_texture(&self, target: types::GLenum, texture: u32) {
-            unsafe { self.BindTexture(target, texture) }
-        }
-        #[allow(clippy::too_many_arguments)]
-        pub fn tex_image_2d(
-            &self,
-            target: types::GLenum,
-            level: i32,
-            internal_format: i32,
-            width: i32,
-            height: i32,
-            border: i32,
-            format: types::GLenum,
-            ty: types::GLenum,
-            pixels: *const std::ffi::c_void,
-        ) {
-            unsafe {
-                self.TexImage2D(
-                    target, level, internal_format, width, height, border, format, ty, pixels,
-                )
-            }
-        }
-        pub fn tex_parameteri(&self, target: types::GLenum, pname: types::GLenum, param: i32) {
-            unsafe { self.TexParameteri(target, pname, param) }
-        }
-        pub fn tex_coord2f(&self, s: f32, t: f32) {
-            unsafe { self.TexCoord2f(s, t) }
-        }
-        pub fn tex_envi(&self, target: types::GLenum, pname: types::GLenum, param: i32) {
-            unsafe { self.TexEnvi(target, pname, param) }
-        }
-        pub fn vertex2f(&self, x: f32, y: f32) {
-            unsafe { self.Vertex2f(x, y) }
-        }
-    }
+    pub use glow::*;
+    pub use glow::HasContext;
+
+    /// The GL context handle passed through every draw call.
+    pub type Gl = glow::Context;
 }
+
+mod edid;
+mod gfx;
 mod medimg;
 pub mod nvstusb;
+pub mod nvtimings;
 mod pulsar;
 mod scene;
 mod screenshot;
@@ -200,10 +43,8 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
 use glutin_winit::{ApiPreference, DisplayBuilder};
-use nvstusb::kms::KmsDisplay;
 use nvstusb::Eye;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::ffi::{c_int, c_void};
+use raw_window_handle::HasWindowHandle;
 use std::num::NonZeroU32;
 use std::time::Instant;
 use stereo_helper::{Camera, CameraType, Vec3};
@@ -218,36 +59,28 @@ pub fn run_demo() {
     println!("Starting up the demo app!");
     let no_emitter = std::env::args().any(|a| a == "--no-emitter");
 
-    // Always try the direct KMS/DRM backend first: it renders straight to the
-    // display engine, so the present vblank is exactly the vblank we predicted
-    // and page-flipped to (best on a bare VT with the projector at 120 Hz).
-    // On a composited desktop DRM master cannot be taken, this returns Err
-    // quickly, and we fall through to the windowed path below.
-    if let Err(e) = run_kms(no_emitter) {
-        eprintln!("nvstusb: KMS/DRM backend unavailable ({e}); falling back to windowed mode");
-    } else {
-        // `run_kms` returned Ok only once its loop exited normally (user
-        // quit) - the whole app is done, so don't fall through to windowed.
-        return;
+    // The shutter is paced exclusively by the DRM/KMS kernel vblank anchor
+    // (see drm.rs), which `nvstusb::init()` only arms when `NVSTUSB_DRM` is
+    // set (was previously set by the removed KMS backend). Enable it here for
+    // the windowed path. Backs off if it cannot be opened (permissions /
+    // no DRM master for enumeration), and `NVSTUSB_DRM_CARD` still selects an
+    // explicit card when the user wants one.
+    if std::env::var_os("NVSTUSB_DRM").is_none() {
+        std::env::set_var("NVSTUSB_DRM", "1");
     }
 
-    // Default windowed path: winit/glutin, which runs on the Wayland
-    // compositor and handles keyboard through winit and sync through the
-    // GLX/swap methods.
+    // Windowed winit/glutin path (Wayland/X11 compositor). Shutter sync uses
+    // the DRM/kernel vblank anchor (the only pacing mechanism, see drm.rs),
+    // which works as a plain client via legacy WAIT_VBLANK.
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
         Err(e) => {
-            eprintln!(
-                "nvstusb: windowed fallback unavailable ({e}); run from a bare VT so the \
-                 direct KMS backend can take the display"
-            );
+            eprintln!("nvstusb: event loop unavailable ({e})");
             return;
         }
     };
-    let mut app = App {
-        no_emitter,
-        ..App::default()
-    };
+    let mut app = App::default();
+    app.no_emitter = no_emitter;
     event_loop.run_app(&mut app).expect("event loop failed");
 }
 
@@ -269,13 +102,47 @@ impl Default for SceneMode {
     }
 }
 
+/// Which per-monitor timing the `,`/`.`/`[`/`]` keys adjust.  The first
+/// three are the 3DVisionActivator / NV3D-Lib "X/Y/W" shutter registers:
+/// X (delay from monitor refresh start to the shutter open edge) is the primary
+/// band-position knob and the default; `t` cycles to Y (open window) and W
+/// (second T2 timer counter — stored per monitor, rarely needs tuning).
+/// `Phase` is the host-side IR packet LEAD before the vblank boundary (the old
+/// "shutter phase" knob; the shutter flip lands ~lead us before the edge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimingTarget {
+    X,
+    Y,
+    W,
+    Phase,
+}
+
+impl TimingTarget {
+    fn next(self) -> Self {
+        match self {
+            TimingTarget::X => TimingTarget::Y,
+            TimingTarget::Y => TimingTarget::W,
+            TimingTarget::W => TimingTarget::Phase,
+            TimingTarget::Phase => TimingTarget::X,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TimingTarget::X => "X (refresh start -> shutter open)",
+            TimingTarget::Y => "Y (shutter open window)",
+            TimingTarget::W => "W (2nd T2 counter)",
+            TimingTarget::Phase => "LEAD (packet -> vblank)",
+        }
+    }
+}
+
 struct App {
     window: Option<Window>,
     gl_surface: Option<Surface<WindowSurface>>,
     gl_context: Option<glutin::context::PossiblyCurrentContext>,
     gl: Option<Gl>,
     nv_ctx: Option<nvstusb::NvstusbContext>,
-    kms: Option<KmsDisplay>,
     cam: Camera,
     gw: i32,
     gh: i32,
@@ -294,6 +161,21 @@ struct App {
     no_emitter: bool,
     alarm_delay_us: u32,
     swap_phase_us: u32,
+    /// Per-monitor shutter timing profile (3DVisionActivator / NV3D-Lib
+    /// "X/Y/W" model).  X = delay from monitor refresh start to the shutter
+    /// open edge (us), Y = shutter open window (us), W = unused on most
+    /// panels (us); Z (frame time) always follows the refresh rate, so the
+    /// "3 params per monitor" are X/Y/W.  Mirrored to `nv_ctx` by
+    /// `apply_shutter_timings`.
+    timing_x_us: f64,
+    timing_y_us: f64,
+    timing_w_us: f64,
+    /// Which timing value the `,`/`.`/`[`/`]` keys adjust.
+    timing_target: TimingTarget,
+    /// Step size the timing keys apply: `,`/`.` adjust by this many us,
+    /// `[`/`]` by ten times it.  Cycle 100 -> 1000 -> 10 -> 1 with `k`
+    /// (mirrors 3DVisionActivator's `I` increment toggle).
+    timing_step_us: u32,
     last_frame_time: Option<Instant>,
     frame_stats: FrameStats,
     last_swap_ret: Option<Instant>,
@@ -311,6 +193,17 @@ struct App {
     /// periodically so moving the window re-targets the emitter's vblank
     /// anchor to the new head.
     last_monitor_name: Option<String>,
+    /// The NV3D-Lib `VENDOR_PRODUCT` base key of the current monitor (from its
+    /// EDID, e.g. `ACI_23F7`).  This is how the tuned profile is keyed in
+    /// `monitor_timings.json` (as `base_<refresh>`, e.g. `ACI_23F7_120`); shown on
+    /// the HUD and in logs so the on-disk name is visible.  `None` when the
+    /// EDID couldn't be read.
+    json_monitor: Option<String>,
+    /// Whether any `NVSTUSB_X_US` / `NVSTUSB_Y_US` / `NVSTUSB_W_US` override
+    /// was applied at startup.  Env overrides win over `monitor_timings.json`, so
+    /// the delayed head-resolution re-apply in `render_once` must not clobber
+    /// them.
+    env_timings_set: bool,
 }
 
 /// Cumulative frame-period statistics (never reset): mean rate, mean period,
@@ -385,14 +278,15 @@ impl FrameStats {
         gw: i32,
         gh: i32,
         phase_us: u32,
+        timings: (f64, f64, f64),
         anchor: &str,
+        regs_live: Option<bool>,
         write_stats: (u64, u64, u64, u64),
         wait_stats: (u64, u64, u64),
         swap_stats: &FrameStats,
         drm_present: (u64, i64, i64),
         drm_resync: (u64, i64, i64),
-        kms_inverted: bool,
-        kms_stages: Option<String>,
+        json_monitor: Option<&str>,
     ) {
         let Some(start) = self.window_start else { return };
         let elapsed = start.elapsed();
@@ -445,8 +339,19 @@ impl FrameStats {
             "[perf] {} frames in {:.3}s: fps={:.2}  period avg={:.0}us min={}us max={}us jitter={}us | expected={:.0}us -> vsync {}",
             self.count, secs, fps, avg_us, self.min_us, self.max_us, jitter_us, expected_us, vsync
         );
+        let regs_str = match regs_live {
+            Some(true) => "regs live".to_string(),
+            Some(false) => "regs unverified".to_string(),
+            None => "regs unprobed".to_string(),
+        };
+        // The key this profile will be saved under in monitor_timings.json (e.g.
+        // `ACI_23F7_120`), so the on-disk name shows up in the perf log too.
+        let json_name = json_monitor
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("[json {}]", nvtimings::key_for(b, nvtimings::round_refresh(refresh))))
+            .unwrap_or_else(|| "[json unreadable]".to_string());
         eprintln!(
-            "[perf]   vblank wait avg={:.0}us max={}us | swap write avg={:.0}us max={}us slow={} | window {}x{} @ {:.2} Hz | phase {}us | anchor {}",
+            "[perf]   vblank wait avg={:.0}us max={}us | swap write avg={:.0}us max={}us slow={} | window {}x{} @ {:.2} Hz | phase {}us | shutter X={:.2}us Y={:.2}us W={:.2}us ({regs_str}) | anchor {} | {}",
             g_avg,
             wait_stats.2,
             w_avg,
@@ -456,7 +361,11 @@ impl FrameStats {
             gh,
             refresh,
             phase_us,
+            timings.0,
+            timings.1,
+            timings.2,
             anchor,
+            json_name,
         );
         if swap_stats.count > 0 {
             eprintln!(
@@ -477,17 +386,9 @@ impl FrameStats {
                 0.0
             };
             eprintln!(
-                "[perf]   drm present err: avg={:.0}us max={}us (predicted vblank - swap return) | resync: n={} avg={:.0}us max={}us | eye inversion: {}",
-                p_avg, drm_present.2, drm_resync.0, r_avg, drm_resync.2,
-                if kms_inverted { "ON (flip lands 1 vblank late)" } else { "OFF (flip lands on prediction)" }
+                "[perf]   drm present err: avg={:.0}us max={}us (predicted vblank - swap return) | resync: n={} avg={:.0}us max={}us",
+                p_avg, drm_present.2, drm_resync.0, r_avg, drm_resync.2
             );
-        }
-        // KMS present pipeline breakdown (swap / lock / flipq / flipwait).
-        // The stage that absorbs the frame budget names the culprit: swap =
-        // GL flush + driver throttle, flipwait = flip latency, a large lock
-        // = buffer starvation, egl-err-after-swap = rejected GPU pushes.
-        if let Some(stages) = kms_stages {
-            eprintln!("[perf]   present stages: {stages}");
         }
 
         self.count = 0;
@@ -505,7 +406,6 @@ impl Default for App {
             gl_context: None,
             gl: None,
             nv_ctx: None,
-            kms: None,
             cam: Camera::default(),
             gw: 800,
             gh: 600,
@@ -519,6 +419,11 @@ impl Default for App {
             no_emitter: false,
             alarm_delay_us: 0,
             swap_phase_us: 2080,
+            timing_x_us: nvstusb::ShutterTimings::reference().x_us,
+            timing_y_us: nvstusb::ShutterTimings::reference().y_us,
+            timing_w_us: nvstusb::ShutterTimings::reference().w_us,
+            timing_target: TimingTarget::X,
+            timing_step_us: 100,
             last_frame_time: None,
             frame_stats: FrameStats::default(),
             last_swap_ret: None,
@@ -527,14 +432,15 @@ impl Default for App {
             perf_due: false,
             app_start: Instant::now(),
             last_monitor_name: None,
+            json_monitor: None,
+            env_timings_set: false,
         }
     }
 }
 
 impl App {
-    /// Renders and presents one frame. Works with both the winit/glutin
-    /// surface and the direct-KMS backend: whichever is present wins. Returns
-    /// early (doing nothing) before the windowed path is set up.
+    /// Renders and presents one frame via the winit/glutin windowed surface.
+    /// Returns early (doing nothing) before the windowed path is set up.
     fn render_once(&mut self) {
         let Some(gl) = self.gl.as_ref() else {
             return;
@@ -546,10 +452,8 @@ impl App {
         // compositor keybinds). Cheap: two winit lookups, no syscalls.
         // Before the first output is known, poll every frame (bounded by the
         // same grace period the emitter's anchor waits before falling back to
-        // a blind first-head scan): the method-1 vblank anchor now refuses to
-        // arm blindly on the first active head, so learning the output early
-        // is what lets it bind to the RIGHT head (and skip the startup
-        // re-target that read as an eye switch).
+        // a blind first-head scan): learning the output early is what lets the
+        // anchor bind to the RIGHT head, not some other display.
         let boot_poll = self.last_monitor_name.is_none()
             && self.frame_accum.count < crate::nvstusb::ARM_GRACE_SWAPS;
         if boot_poll || self.frame_accum.count % 120 == 0 {
@@ -558,22 +462,81 @@ impl App {
                 let name = mon.as_ref().and_then(|m| m.name());
                 let mhz = mon.as_ref().and_then(|m| m.refresh_rate_millihertz());
                 if name != self.last_monitor_name {
+                    // Re-derive the JSON identity key for the new head so the
+                    // HUD / logs / `s` save always name the entry that would
+                    // be written to monitor_timings.json.
+                    let new_base = name
+                        .as_deref()
+                        .filter(|n| !n.is_empty())
+                        .and_then(|conn| crate::edid::resolve_base(conn, None));
                     eprintln!(
-                        "[monitor] window output {:?} -> {:?}",
-                        self.last_monitor_name, name
+                        "[monitor] window output {:?} -> {:?} (json {})",
+                        self.last_monitor_name,
+                        name,
+                        new_base
+                            .as_deref()
+                            .unwrap_or("<unreadable EDID>")
                     );
                     self.last_monitor_name = name.clone();
+                    self.json_monitor = new_base.clone();
                     if let Some(ctx) = self.nv_ctx.as_mut() {
+                        // Re-bind the emitter's kernel vblank anchor to the
+                        // output the window is now on.  On a multi-head GPU the
+                        // per-head vblank grids share no fixed phase, so an
+                        // anchor left on the previous head free-runs at the
+                        // same refresh but wrong phase -> the shutter flips
+                        // mid-scanout and the frame lock breaks ("not
+                        // anchored").  Must run before config/pacing below uses
+                        // the new grid.
                         ctx.set_target_connector(name.as_deref());
-                        // Follow the new output's mode rate as well, so the
-                        // emitter matches what is actually on screen in
-                        // mixed-refresh multi-monitor setups. Only with a
-                        // plausible wl_output-reported rate: never fall back
-                        // to the XWayland global rate here, it may belong to
-                        // the OTHER monitor.
+                        // Follow the new output's mode rate FIRST so the
+                        // monitor_timings.json lookup below resolves the profile at
+                        // the rate this head actually runs (a different
+                        // connector may be a different panel, or the same panel
+                        // at a different refresh).  Only with a plausible
+                        // wl_output-reported rate: never fall back to the
+                        // XWayland global rate here, it may belong to the OTHER
+                        // monitor.
                         if let Some(mhz) = mhz.filter(|v| *v >= 60_000) {
                             stereo_helper::config_refresh_rate(ctx, Some(mhz));
                         }
+                        // Apply the head's saved monitor_timings.json shutter profile
+                        // whenever the window actually switched heads (we are
+                        // inside the `name != last_monitor_name` block), so both
+                        // a different EDID base and a different refresh are
+                        // honored.  Skipped only when a `NVSTUSB_*_US` env
+                        // override is in effect — env wins over the JSON.
+                        // Resolved inline (not via a `&mut self` method) because
+                        // `self.gl` is immutably borrowed for the rest of this
+                        // frame.
+                        if !self.env_timings_set {
+                            let rate_hz = ctx.rate();
+                            if rate_hz > 60.0 {
+                                if let Some(base) = new_base.as_deref() {
+                                    if let Some((key, e)) =
+                                        nvtimings::resolve(&nvtimings::load(), base, rate_hz)
+                                    {
+                                        self.timing_x_us = e.x_us;
+                                        self.timing_y_us = e.y_us;
+                                        self.timing_w_us = e.w_us;
+                                        let lead = e.lead_us.round().max(0.0) as u32;
+                                        self.swap_phase_us = lead;
+                                        ctx.set_swap_phase_us(lead);
+                                        println!(
+                                            "Loaded shutter timings from {} [{}]: X={}us Y={}us W={}us LEAD={}us Z={}us",
+                                            nvtimings::db_path().display(),
+                                            key,
+                                            e.x_us,
+                                            e.y_us,
+                                            e.w_us,
+                                            e.lead_us,
+                                            e.z_us()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ctx.set_shutter_timings(self.timing_x_us, self.timing_y_us, self.timing_w_us);
                     }
                 }
             }
@@ -629,33 +592,39 @@ impl App {
             self.pulsar_angle,
         );
 
-        // Present via whichever backend is active. `Surface` is not `Clone`,
-        // so the swap closure captures disjoint field borrows directly.
-        // Returns the KMS backend's flip hardware timestamp when available
-        // (see `nvstusb::swap`); other backends have none to give.
-        // (Snapshot before the closure's mutable borrow of self.kms starts;
-        // the stage stats themselves are statics, no instance needed.)
-        let kms_active = self.kms.is_some();
-        let mut swap_fn: Box<dyn FnMut() -> Option<u64> + '_> = match (
-            self.gl_surface.as_ref(),
-            self.gl_context.as_ref(),
-            self.kms.as_mut(),
-        ) {
-            (Some(surface), Some(context), _) => {
-                Box::new(move || {
-                    let _ = surface.swap_buffers(context);
-                    None
-                })
-            }
-            (_, _, Some(kms)) => Box::new(move || match kms.present() {
-                Ok(ts) => ts,
-                Err(e) => {
-                    eprintln!("nvstusb: kms present: {e}");
-                    None
+        // Left-edge debug HUD: the per-monitor shutter timing profile
+        // (X/Y/W, us) and which parameter the timing keys currently adjust,
+        // rendered with the bitmap `text` overlay. Always visible so tuning
+        // values are readable on the AltBlink checker without a terminal.
+        draw_timing_hud(
+            gl,
+            self.gw,
+            self.gh,
+            self.timing_target,
+            self.timing_x_us,
+            self.timing_y_us,
+            self.timing_w_us,
+            self.nv_ctx.as_ref().map(|c| c.rate()).unwrap_or(0.0),
+            self.swap_phase_us,
+            self.timing_step_us,
+            self.nv_ctx.as_ref().and_then(|c| c.timings_live()),
+            self.json_monitor.as_deref(),
+        );
+
+        // Present via the windowed backend. `Surface` is not `Clone`, so the
+        // swap closure captures the two field borrows directly. The windowed
+        // swap (glutin `swap_buffers`) has no flip hardware timestamp to give
+        // back, so it always returns `None`.
+        let mut swap_fn: Box<dyn FnMut() -> Option<u64> + '_> =
+            match (self.gl_surface.as_ref(), self.gl_context.as_ref()) {
+                (Some(surface), Some(context)) => {
+                    Box::new(move || {
+                        let _ = surface.swap_buffers(context);
+                        None
+                    })
                 }
-            }),
-            _ => Box::new(|| None),
-        };
+                _ => Box::new(|| None),
+            };
 
         // Let the usb emitter code swap and keep track of things.
         let eye = if show != 0 { Eye::Left } else { Eye::Right };
@@ -716,31 +685,24 @@ impl App {
                     Some(ctx) if ctx.vblank_method() == 4 => ctx.drm_resync_stats(),
                     _ => (0, 0, 0),
                 };
-                let kms_inverted = match self.nv_ctx.as_ref() {
-                    Some(ctx) if ctx.vblank_method() == 4 => ctx.kms_eye_inverted(),
-                    _ => false,
-                };
                 self.frame_stats.report_and_reset(
                     refresh,
                     self.gw,
                     self.gh,
                     self.swap_phase_us,
+                    (self.timing_x_us, self.timing_y_us, self.timing_w_us),
                     self.nv_ctx
                         .as_ref()
                         .map(|c| c.anchor_name())
                         .unwrap_or_else(|| "none".to_string())
                         .as_str(),
+                    self.nv_ctx.as_ref().and_then(|c| c.timings_live()),
                     write,
                     wait,
                     &self.swap_stats,
                     drm_present,
                     drm_resync,
-                    kms_inverted,
-                    if kms_active {
-                        KmsDisplay::take_present_stats_line()
-                    } else {
-                        None
-                    },
+                    self.json_monitor.as_deref(),
                 );
                 self.swap_stats = FrameStats::default();
                 // These are cumulative atomics/fields, not tied to
@@ -778,8 +740,8 @@ impl App {
     /// should quit.
     fn process_key(&mut self, c: char) -> bool {
         match c {
-            // 'q' or Escape (0x1b; Escape arrives as Key::Escape in winit and
-            // as byte 0x1b on the VT/KMS raw-tty path) quits cleanly.
+            // 'q' or Escape (0x1b; winit delivers Escape as Key::Escape with
+            // the \u{1b} character) quits cleanly.
             'q' | 'Q' | '\u{1b}' => return true,
             'c' | 'C' => {
                 if self.cam.camera_type == CameraType::ToeIn {
@@ -798,16 +760,24 @@ impl App {
                     _ => println!("Forcing right eye always."),
                 }
             }
-            's' | 'S' => {
+            's' => self.save_timings(),
+            'S' => {
                 if let Some(gl) = &self.gl {
                     screenshot::screenshot(gl, 0, 0, self.gw, self.gh, "screenshot.tga");
                     println!("Wrote frame buffer to screenshot.tga.");
                 }
             }
-            ',' | ';' => self.adjust_delay(-100),
-            '.' | ':' => self.adjust_delay(100),
-            '[' | '{' => self.adjust_delay(-1000),
-            ']' | '}' => self.adjust_delay(1000),
+            ',' | ';' => self.adjust_timing(-(self.timing_step_us as i64)),
+            '.' | ':' => self.adjust_timing(self.timing_step_us as i64),
+            '[' | '{' => self.adjust_timing(-(self.timing_step_us as i64) * 10),
+            ']' | '}' => self.adjust_timing(self.timing_step_us as i64 * 10),
+            // Cycle which shutter timing the keys above adjust:
+            // X (refresh start -> open) -> Y (open window) -> W.
+            't' | 'T' => self.cycle_timing_target(),
+            // Cycle the timing step size (3DVisionActivator's I key):
+            // 100 -> 1000 -> 10 -> 1 us, so coarse sweeps and hairline
+            // nudges both are reachable without leaving the keyboard.
+            'k' | 'K' => self.cycle_timing_step(),
             'i' | 'I' => {
                 if let Some(ctx) = self.nv_ctx.as_mut() {
                     ctx.invert_eyes();
@@ -818,18 +788,6 @@ impl App {
                         } else {
                             "OFF"
                         }
-                    );
-                }
-            }
-            'o' | 'O' => {
-                // Multi-monitor fallback for drivers that hide connector
-                // names from plain clients (nvidia-drm): cycle which CRTC
-                // pipe the vblank anchor binds to until the blue/red scene
-                // separates cleanly. Wraps back to auto after pipe7.
-                if let Some(ctx) = self.nv_ctx.as_mut() {
-                    ctx.cycle_anchor_pipe();
-                    println!(
-                        "Cycled sync anchor pipe (watch the blue/red scene; auto after pipe7)."
                     );
                 }
             }
@@ -870,17 +828,201 @@ impl App {
         false
     }
 
-    /// Bumps the host-side post-swap phase delay by `delta` us and pushes it to
-    /// the context so the shutter IR fire can be aligned live with the frame
-    /// boundary without reflashing. Clamped to one frame period.
-    fn adjust_delay(&mut self, delta: i32) {
-        let new = (self.swap_phase_us as i32 + delta).clamp(0, 8334) as u32;
-        self.swap_phase_us = new;
-        if let Some(ctx) = self.nv_ctx.as_mut() {
-            ctx.set_swap_phase_us(new);
+    /// Rebinds the `,`/`.`/`[`/`]` keys to the 3DVisionActivator / NV3D-Lib
+    /// per-monitor shutter timings `X`/`Y`/`W` plus the host packet lead
+    /// `Phase`: `adjust_timing` bumps whichever is selected and programs the
+    /// emitter's timing registers (X/Y/W) or the host lead live.
+    /// `,`/`.` apply the current step (`timing_step_us`, 100 by default) and
+    /// `[`/`]` ten times it; `k` cycles the step through 100/1000/10/1.
+    /// (Previously these keys tuned the host-side packet lead, which only ever
+    /// changed clarity/pairing near a boundary — this moves the actual shutter
+    /// edge through the frame instead, on firmware that honors the registers;
+    /// see `NvstusbContext::timings_live`.)
+    fn adjust_timing(&mut self, delta: i64) {
+        let period = self
+            .nv_ctx
+            .as_ref()
+            .map(|c| c.rate())
+            .filter(|r| *r > 60.0)
+            .map_or(8334.0, |r| 1e6 / r as f64);
+        let new = match self.timing_target {
+            TimingTarget::X => (self.timing_x_us + delta as f64).clamp(0.0, period),
+            TimingTarget::Y => (self.timing_y_us + delta as f64).clamp(0.0, period),
+            TimingTarget::W => (self.timing_w_us + delta as f64).clamp(0.0, period),
+            TimingTarget::Phase => (self.swap_phase_us as f64 + delta as f64)
+                .clamp(0.0, 7000.0),
+        };
+        match self.timing_target {
+            TimingTarget::X => self.timing_x_us = new,
+            TimingTarget::Y => self.timing_y_us = new,
+            TimingTarget::W => self.timing_w_us = new,
+            TimingTarget::Phase => {
+                self.set_swap_phase_us(new as u32);
+            }
         }
-        println!("IR phase delay: {} us", new);
+        self.apply_shutter_timings();
+        println!("Shutter {}: {new:.3} us", self.timing_target.label());
     }
+
+    /// Cycles which timing the `,`/`.`/`[`/`]` keys adjust: X -> Y -> W ->
+    /// LEAD (host packet lead) -> X.
+    fn cycle_timing_target(&mut self) {
+        self.timing_target = self.timing_target.next();
+        let v = match self.timing_target {
+            TimingTarget::X => self.timing_x_us,
+            TimingTarget::Y => self.timing_y_us,
+            TimingTarget::W => self.timing_w_us,
+            TimingTarget::Phase => self.swap_phase_us as f64,
+        };
+        println!(
+            "Now adjusting shutter {}: {v:.3} us (X/S, Y/A, W/Q in 3DVisionActivator)",
+            self.timing_target.label()
+        );
+    }
+
+    /// Sets the host-side packet lead (us) in the emitter and remembers it in
+    /// the App, so a `Phase` key/adjust keeps them in agreement.  No-op
+    /// without an emitter.
+    fn set_swap_phase_us(&mut self, us: u32) {
+        self.swap_phase_us = us;
+        if let Some(ctx) = self.nv_ctx.as_mut() {
+            ctx.set_swap_phase_us(us);
+        }
+    }
+
+    /// Cycles the timing step size the `,`/`.` (x1) and `[`/`]` (x10) keys
+    /// apply, mirroring 3DVisionActivator's `I` increment toggle:
+    /// 100 -> 1000 -> 10 -> 1 us.
+    fn cycle_timing_step(&mut self) {
+        self.timing_step_us = match self.timing_step_us {
+            100 => 1000,
+            1000 => 10,
+            10 => 1,
+            _ => 100,
+        };
+        println!(
+            "Timing step: {} us (`,`,`.` adjust by this; `[`,`]` by {} us)",
+            self.timing_step_us,
+            self.timing_step_us * 10
+        );
+    }
+
+    /// Pushes the app's X/Y/W shutter-timing profile into the emitter,
+    /// programming the timing registers live.  No-op without an emitter.
+    fn apply_shutter_timings(&mut self) {
+        if let Some(ctx) = self.nv_ctx.as_mut() {
+            ctx.set_shutter_timings(self.timing_x_us, self.timing_y_us, self.timing_w_us);
+        }
+    }
+
+    /// Resolves the `monitor_timings.json` profile for `base` (`VENDOR_PRODUCT`) at
+    /// the current measured refresh and applies it.  Used at startup and again
+    /// when the window first lands on a head: at startup the wl_output is
+    /// often still `None`, so the EDID identity isn't known until the periodic
+    /// `[monitor]` recheck in `render_once` runs.  Only overrides when a
+    /// profile actually matches, so defaults survive a missing/empty DB.
+    /// Applies the per-monitor values: shutter X/Y/W registers AND the
+    /// host-side IR lead (`lead_us`), both stored per monitor in the file.
+    fn apply_json_timings_for(&mut self, base: &str) {
+        let rate_hz = self.nv_ctx.as_ref().map(|c| c.rate()).unwrap_or(0.0);
+        if rate_hz <= 60.0 {
+            return;
+        }
+        if let Some((key, e)) = nvtimings::resolve(&nvtimings::load(), base, rate_hz) {
+            self.timing_x_us = e.x_us;
+            self.timing_y_us = e.y_us;
+            self.timing_w_us = e.w_us;
+            println!(
+                "Loaded shutter timings from {} [{}]: X={}us Y={}us W={}us LEAD={}us Z={}us",
+                nvtimings::db_path().display(),
+                key,
+                e.x_us,
+                e.y_us,
+                e.w_us,
+                e.lead_us,
+                e.z_us()
+            );
+            self.apply_shutter_timings();
+            self.set_swap_phase_us(e.lead_us.round().max(0.0) as u32);
+        }
+    }
+
+    /// Saves the currently-tuned shutter profile (X/Y/W + host lead + refresh)
+    /// to `monitor_timings.json` under the active monitor's `VENDOR_PRODUCT_REFRESH`
+    /// key (from its EDID, e.g. `ACI_23F7_120`).  The DB holds only the user's
+    /// own tuned monitors, so `s` replaces the file with just this entry.
+    /// Bound to `s`. The saved entry is what `nvstereo3d-host` and the demo
+    /// itself re-read at startup, so tuning a monitor once and pressing `s`
+    /// persists it across runs.
+    fn save_timings(&mut self) {
+        // Which refresh are we writing? Prefer the emitter's configured rate
+        // (the measured mode rate); fall back to the reference.
+        let refresh = self
+            .nv_ctx
+            .as_ref()
+            .map(|c| c.rate())
+            .filter(|r| *r > 60.0)
+            .unwrap_or(120.0);
+
+        // Monitor identity: the NV3D-Lib `VENDOR_PRODUCT` base (e.g.
+        // `ACI_23F7`) for the current head, kept on `self` (from EDID) so the
+        // HUD / logs / save all name the same entry.  Falls back to a live
+        // EDID read if the field isn't populated yet (pressed before the first
+        // render tick).
+        let base = self
+            .json_monitor
+            .clone()
+            .or_else(|| {
+                self.last_monitor_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|conn| crate::edid::resolve_base(conn, None))
+            });
+        let Some(base) = base else {
+            eprintln!(
+                "Could not read EDID for monitor {:?}; not saving timings \
+                 (need the kernel connector name, e.g. DP-1)",
+                self.last_monitor_name
+            );
+            return;
+        };
+        let key = nvtimings::key_for(&base, nvtimings::round_refresh(refresh));
+
+        // The project's own flat per-monitor entry: the tuned X/Y/W registers,
+        // the host-side IR lead (LEAD / `Phase` knob), the measured refresh and
+        // a derived pixel-clock figure.  `z` (frame time) is derived as
+        // 1e6/refresh at use time, so it is not stored.
+        let entry = nvtimings::MonitorEntry {
+            refresh_hz: refresh as f64,
+            frequency_10khz: (refresh * 1e-3).round() as u64, // ~10 kHz per Hz
+            x_us: self.timing_x_us,
+            y_us: self.timing_y_us,
+            w_us: self.timing_w_us,
+            lead_us: self.swap_phase_us as f64,
+        };
+        // The DB holds ONLY the user's own tuned monitors, so saving replaces
+        // the file with just this entry.
+        match nvtimings::save_entry(&key, &entry) {
+            Ok(path) => println!(
+                "Saved shutter timings to {} [{}]: X={:.3}us Y={:.3}us W={:.3}us LEAD={:.0}us Z={:.3}us @ {:.3} Hz",
+                path.display(),
+                key,
+                self.timing_x_us,
+                self.timing_y_us,
+                self.timing_w_us,
+                self.swap_phase_us,
+                1_000_000.0 / refresh as f64,
+                refresh
+            ),
+            Err(e) => eprintln!("Failed to save shutter timings: {e}"),
+        }
+    }
+}
+
+/// Reads a float (microseconds, e.g. X=0.5) from an environment variable.
+fn env_f64(name: &str) -> Option<f64> {
+    let raw = std::env::var_os(name)?;
+    raw.into_string().ok()?.trim().parse::<f64>().ok()
 }
 
 /// Draws the frame for the given eye (1 = left, 0 = right). `eye` is the eye
@@ -916,8 +1058,8 @@ fn draw(
 ) {
     // Reset the clear colour so a previous AltBlink blue/red doesn't leak
     // into the geometry scenes.
-    gl.clear_color(0.0, 0.0, 0.0, 1.0);
-    gl.clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+    gfx::clear_color(gl, 0.0, 0.0, 0.0, 1.0);
+    gfx::clear(gl, gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
 
     // The label baseline y, raised the requested 2 cm above the original
     // position (glDrawPixels y counts upward from the bottom scanline).
@@ -930,15 +1072,19 @@ fn draw(
         _ => 0,
     };
 
+    // The camera's projection and per-eye offset are baked into one
+    // model-view-projection matrix per frame (the fixed-function matrix stack
+    // is gone); the geometry scenes submit their already-transformed vertex
+    // data under this `mvp`.
+    let mvp = stereo_helper::project_mvp(cam, gw as f32 / gh as f32, show);
+
     match scene {
         // The medimg RDS scene draws straight to the framebuffer via a
         // full-screen textured quad; it needs no camera projection.
         SceneMode::Rds => medimg::draw_rds(gl, gw, gh, show, depth, bg),
         // 3dvgl diagnostic pattern (hexagons / triangles).
         SceneMode::HexTri => {
-            stereo_helper::project_camera(gl, cam, gw as f32 / gh as f32, show);
-            scene::make_lighting(gl);
-            scene::make_geometry(gl, cam, show);
+            scene::make_geometry(gl, cam, show, mvp);
             // Label which lens should see which pattern, in that eye's own
             // scene colour. Each eye's frame is labelled for itself, so
             // through the shutters the mapping - and any L/R inversion - is
@@ -954,9 +1100,7 @@ fn draw(
         }
         // 3dvgl-c "pulsar".
         SceneMode::Pulsar => {
-            stereo_helper::project_camera(gl, cam, gw as f32 / gh as f32, show);
-            pulsar::make_lighting(gl);
-            pulsar::make_geometry(gl, angle);
+            pulsar::make_geometry(gl, angle, mvp);
         }
         // Alternating red/blue frames for checking L/R sync: the whole
         // framebuffer is one solid color per eye, so any phase slip or eye
@@ -964,8 +1108,8 @@ fn draw(
         // Red is the LEFT eye and blue the RIGHT eye.
         SceneMode::AltBlink => {
             let (r, g, b) = if show != 0 { (1.0, 0.0, 0.0) } else { (0.0, 0.0, 1.0) };
-            gl.clear_color(r, g, b, 1.0);
-            gl.clear(gl::COLOR_BUFFER_BIT);
+            gfx::clear_color(gl, r, g, b, 1.0);
+            gfx::clear(gl, gl::COLOR_BUFFER_BIT);
             // Label which lens should see which colour. White text: drawn in
             // the frame's own colour, the label would vanish into the solid
             // background.
@@ -977,54 +1121,114 @@ fn draw(
     }
 }
 
-/// Names the winit display-handle backend variant (diagnostics).
-fn dpy_kind(h: Option<&raw_window_handle::RawDisplayHandle>) -> &'static str {
-    use raw_window_handle::RawDisplayHandle as D;
-    match h {
-        Some(D::Xlib(_)) => "Xlib",
-        Some(D::Xcb(_)) => "Xcb",
-        Some(D::Wayland(_)) => "Wayland",
-        Some(_) => "other",
-        None => "unavailable",
-    }
-}
+/// Draws the left-edge debug HUD: which shutter-timing parameter the
+/// `,`/`.`/`[`/`]` keys adjust, the current X/Y/W values (the 3D Vision
+/// per-monitor timings, microseconds), the refresh rate (Z is fixed to it),
+/// the host packet lead, whether the emitter actually honors the timing
+/// registers (genuine firmware vs clone) and the current step size.  Drawn
+/// with the bitmap `text` overlay after the scene, so it reads on any scene —
+/// including the solid AltBlink checker — without a GL font dependency.
+#[allow(clippy::too_many_arguments)]
+fn draw_timing_hud(
+    gl: &Gl,
+    gw: i32,
+    gh: i32,
+    target: TimingTarget,
+    x_us: f64,
+    y_us: f64,
+    w_us: f64,
+    rate_hz: f32,
+    phase_us: u32,
+    step_us: u32,
+    regs_live: Option<bool>,
+    json_monitor: Option<&str>,
+) {
+    let scale = (gw / 1500).clamp(1, 3);
+    let lh = 7 * scale + 4;
+    let x = 12;
+    let mut y = 10;
 
-/// Names the winit window-handle backend variant (diagnostics).
-fn win_kind(h: Option<&raw_window_handle::RawWindowHandle>) -> &'static str {
-    use raw_window_handle::RawWindowHandle as W;
-    match h {
-        Some(W::Xlib(_)) => "Xlib",
-        Some(W::Xcb(_)) => "Xcb",
-        Some(W::Wayland(_)) => "Wayland",
-        Some(_) => "other",
-        None => "unavailable",
-    }
-}
+    text::draw_text(gl, gw, gh, "SHUTTER TIMING", x, y, scale, 0.55, 0.55, 0.55);
+    y += lh;
 
-/// Opens a private Xlib display on `$DISPLAY` via dlopen, for OML sync-value
-/// queries when winit only exposes an XCB connection.  The handle is
-/// intentionally leaked: it must outlive every query and lives for the
-/// process anyway.
-fn open_xlib_display() -> usize {
-    unsafe {
-        for name in ["libX11.so.6", "libX11.so"] {
-            if let Ok(lib) = libloading::Library::new(name) {
-                let f: libloading::Symbol<
-                    unsafe extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_void,
-                > = match lib.get(b"XOpenDisplay") {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let dpy = f(std::ptr::null());
-                if !dpy.is_null() {
-                    std::mem::forget(lib);
-                    eprintln!("nvstusb: opened private Xlib display via {name}");
-                    return dpy as usize;
-                }
-            }
-        }
+    let rows = [
+        ("X REFRESH->OPEN", TimingTarget::X, x_us),
+        ("Y OPEN WINDOW", TimingTarget::Y, y_us),
+        ("W T2 COUNTER", TimingTarget::W, w_us),
+        ("LEAD PACKET->VBLANK", TimingTarget::Phase, phase_us as f64),
+    ];
+    for (label, which, val) in rows {
+        let (prefix, (r, g, b)) = if which == target {
+            (">", (0.25f32, 1.0f32, 0.4f32))
+        } else {
+            (" ", (1.0f32, 1.0f32, 1.0f32))
+        };
+        text::draw_text(
+            gl,
+            gw,
+            gh,
+            &format!("{prefix} {label} {val:.2}"),
+            x,
+            y,
+            scale,
+            r,
+            g,
+            b,
+        );
+        y += lh;
     }
-    0
+
+    y += lh / 2;
+    let rate_str = if rate_hz > 60.0 {
+        format!("  {rate_hz:.2} HZ (Z FIXED)")
+    } else {
+        "  RATE UNKNOWN".to_string()
+    };
+    text::draw_text(gl, gw, gh, &rate_str, x, y, scale, 0.55, 0.55, 0.55);
+    y += lh;
+    // The name the tuned profile is saved under in monitor_timings.json (e.g.
+    // `ACI_23F7_120`), so what you press `s` to write is visible on screen.
+    let (json_text, (jr, jg, jb)) = match json_monitor {
+        Some(base) if rate_hz > 60.0 => (
+            format!("  JSON <{}>", nvtimings::key_for(base, nvtimings::round_refresh(rate_hz))),
+            (0.55f32, 0.75f32, 1.0f32),
+        ),
+        Some(base) => (
+            format!("  JSON <{}> (rate unknown)", base),
+            (0.55f32, 0.75f32, 1.0f32),
+        ),
+        None => (
+            "  JSON <unreadable EDID>".to_string(),
+            (0.5f32, 0.5f32, 0.5f32),
+        ),
+    };
+    text::draw_text(gl, gw, gh, &json_text, x, y, scale, jr, jg, jb);
+    y += lh;
+    // Whether the timing registers were verified live: X/Y/W live means the
+    // device echoed the 0x2007 block back with the written values; unverified
+    // means the readback was silent or mismatched (NOT proof the block is
+    // unimplemented — a device that answers late legitimately lands here).
+    let (regs_text, (r, g, b)) = match regs_live {
+        Some(true) => ("  TIMING REGS LIVE", (0.25f32, 1.0f32, 0.4f32)),
+        Some(false) => ("  TIMING REGS UNVERIFIED", (0.9f32, 0.7f32, 0.2f32)),
+        None => ("  TIMING REGS UNCHECKED", (0.5f32, 0.5f32, 0.5f32)),
+    };
+    text::draw_text(gl, gw, gh, regs_text, x, y, scale, r, g, b);
+    y += lh;
+    text::draw_text(
+        gl,
+        gw,
+        gh,
+        &format!("  STEP {} US (K=SWITCH)", step_us),
+        x,
+        y,
+        scale,
+        0.55,
+        0.55,
+        0.55,
+    );
+    y += lh;
+    text::draw_text(gl, gw, gh, "  T=SWITCH TARGET  I=SWAP EYES", x, y, scale, 0.4, 0.4, 0.4);
 }
 
 impl ApplicationHandler for App {
@@ -1168,10 +1372,12 @@ impl ApplicationHandler for App {
         };
 
         // Load the fixed-function GL functions through the display.
-        let gl = Gl::load_with(|symbol| {
-            let cstr = std::ffi::CString::new(symbol).unwrap();
-            display.get_proc_address(&cstr)
-        });
+        let gl = unsafe {
+            glow::Context::from_loader_function(|symbol| {
+                let cstr = std::ffi::CString::new(symbol).unwrap();
+                display.get_proc_address(&cstr)
+            })
+        };
 
         // vsync
         if let Err(e) =
@@ -1183,13 +1389,11 @@ impl ApplicationHandler for App {
         }
 
         // Set up OpenGL state.
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
-        gl.enable(gl::DEPTH_TEST);
-        gl.shade_model(gl::SMOOTH);
-        gl.enable(gl::COLOR_MATERIAL);
-        gl.color_material(gl::FRONT_AND_BACK, gl::AMBIENT_AND_DIFFUSE);
-        gl.viewport(0, 0, inner.width as i32, inner.height as i32);
+        gfx::clear_color(&gl, 0.0, 0.0, 0.0, 1.0);
+        gfx::enable(&gl, gl::DEPTH_TEST);
+        gfx::viewport(&gl, 0, 0, inner.width as i32, inner.height as i32);
         screenshot::init(&gl);
+        text::init(&gl);
 
         // Set up our 3D camera (see stereo_helper for more documentation).
         let mut cam = Camera::default();
@@ -1217,10 +1421,10 @@ impl ApplicationHandler for App {
         // at a mid-run scene switch stalls the swap loop for ~100 ms in a debug
         // build (~seconds at 2560x1440) and de-phases the shutter packets,
         // which shows as a wrong-eye / wrong-depth flash after switching to
-        // scene 2 until the stream re-locks. The KMS path warms for exactly
-        // this reason (`run_kms`), but the windowed path had no equivalent.
+        // scene 2 until the stream re-locks.
         if let Some(gl) = self.gl.as_ref() {
             medimg::warm(gl, self.gw, self.gh);
+            scene::warm(gl, self.cam);
             pulsar::warm(gl);
         }
 
@@ -1234,66 +1438,12 @@ impl ApplicationHandler for App {
         // `Display*`.  If winit hands us an XCB connection instead, we open
         // our own Xlib display on $DISPLAY - sync-value queries are
         // server-side and work from a second connection.
-        if let Some(ctx) = self.nv_ctx.as_mut() {
-            let win = self.window.as_ref().unwrap();
-            let dpy_raw = win.display_handle().map(|h| h.as_raw());
-            let win_raw = win.window_handle().map(|h| h.as_raw());
-            eprintln!(
-                "nvstusb: winit handles: display={} window={}",
-                dpy_kind(dpy_raw.as_ref().ok()),
-                win_kind(win_raw.as_ref().ok()),
-            );
-
-            // Native Wayland: arm the EGL present clock over the app's own
-            // wl_display/wl_surface instead.
-            match (&dpy_raw, &win_raw) {
-                (
-                    Ok(raw_window_handle::RawDisplayHandle::Wayland(d)),
-                    Ok(raw_window_handle::RawWindowHandle::Wayland(w)),
-                ) => {
-                    ctx.set_wayland_target(
-                        d.display.as_ptr() as usize,
-                        w.surface.as_ptr() as usize,
-                    );
-                }
-                _ => {
-                    let mut xlib_dpy = match dpy_raw {
-                        Ok(raw_window_handle::RawDisplayHandle::Xlib(d)) => {
-                            d.display.map(|p| p.as_ptr() as usize).unwrap_or(0)
-                        }
-                        _ => 0,
-                    };
-                    let drawable = match win_raw {
-                        Ok(raw_window_handle::RawWindowHandle::Xlib(w)) => w.window as u64,
-                        Ok(raw_window_handle::RawWindowHandle::Xcb(w)) => {
-                            u64::from(w.window.get())
-                        }
-                        _ => 0,
-                    };
-
-                    if xlib_dpy == 0 && drawable != 0 {
-                        xlib_dpy = open_xlib_display();
-                    }
-
-                    if xlib_dpy != 0 && drawable != 0 {
-                        ctx.set_x11_target(xlib_dpy, drawable);
-                    } else {
-                        eprintln!(
-                            "nvstusb: present feedback disabled (dpy={:#x} drawable={:#x})",
-                            xlib_dpy, drawable
-                        );
-                    }
-                }
-            }
-        }
+        // (Present-clock / OML feedback targeting removed: shutter pacing uses
+        // only the DRM kernel vblank anchor, opened at init.)
 
         // Auto-config the vsync rate.  Runs now that the context lives at a
         // stable address in `self` (see the note at the top of `resumed`).
         if let Some(ctx) = self.nv_ctx.as_mut() {
-            // Bind the kernel vblank anchor to the output showing this window
-            // (multi-monitor GPUs: wrong head == de-phased shutters), and use
-            // that monitor's own mode rate for the emitter.
-            ctx.set_target_connector(monitor_name.as_deref());
             stereo_helper::config_refresh_rate(ctx, monitor_mhz);
 
             // Optional initial shutter delay (us), e.g. NVSTUSB_DELAY_US=5000.
@@ -1323,6 +1473,67 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Per-monitor shutter timings (3DVisionActivator / NV3D-Lib X/Y/W
+        // model): optional NVSTUSB_TIMINGS_INI, then monitor_timings.json (matched
+        // by refresh rate), then NVSTUSB_X_US / NVSTUSB_Y_US / NVSTUSB_W_US
+        // overrides.  Later sources override earlier ones; the env overrides
+        // always win.  X/Y/W program the emitter's shutter-timing registers
+        // (Z/fps stays fixed to the monitor).  Defaults to the 1440p @ 120 Hz
+        // reference, and the `,`/`.`/`[`/`]` keys tune them live afterwards.
+        // The `s` key writes the tuned profile back into monitor_timings.json.
+        let rate_hz = self.nv_ctx.as_ref().map(|c| c.rate()).unwrap_or(0.0);
+        if rate_hz > 60.0 {
+            if let Some(raw) = std::env::var_os("NVSTUSB_TIMINGS_INI") {
+                if let Ok(path) = raw.into_string() {
+                    match nvstusb::ShutterTimings::from_ini_file(&path, rate_hz, 0.5) {
+                        Some(t) => {
+                            self.timing_x_us = t.x_us;
+                            self.timing_y_us = t.y_us;
+                            self.timing_w_us = t.w_us;
+                            println!(
+                                "Loaded shutter timings from {path}: X={}us Y={}us Z={}us W={}us",
+                                t.x_us, t.y_us, t.z_us, t.w_us
+                            );
+                        }
+                        None => eprintln!(
+                            "NVSTUSB_TIMINGS_INI={path}: no profile near {rate_hz:.3} Hz; keeping defaults"
+                        ),
+                    }
+                }
+            }
+            // monitor_timings.json (the repo's checked-in DB, or a file written by
+            // `s`): resolve by this monitor's EDID `VENDOR_PRODUCT` base and
+            // the measured refresh rate, exactly as NV3D-Lib looks entries up.
+            // Only if a profile is found do we override.  Note the base may be
+            // `None` here because the wl_output is usually not known until the
+            // first `[monitor]` recheck in `render_once`; that path re-applies
+            // the profile once the head is resolved (see `apply_json_timings_for`).
+            let json_base = monitor_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(|conn| crate::edid::resolve_base(conn, None));
+            self.json_monitor = json_base.clone();
+            if let Some(base) = json_base.as_deref() {
+                self.apply_json_timings_for(&base);
+            }
+            if let Some(v) = env_f64("NVSTUSB_X_US") {
+                self.timing_x_us = v;
+                self.env_timings_set = true;
+                println!("Set shutter X (refresh->open) to {v} us");
+            }
+            if let Some(v) = env_f64("NVSTUSB_Y_US") {
+                self.timing_y_us = v;
+                self.env_timings_set = true;
+                println!("Set shutter Y (open window) to {v} us");
+            }
+            if let Some(v) = env_f64("NVSTUSB_W_US") {
+                self.timing_w_us = v;
+                self.env_timings_set = true;
+                println!("Set shutter W to {v} us");
+            }
+            self.apply_shutter_timings();
+        }
+
         if let Some(ctx) = self.nv_ctx.as_ref() {
             eprintln!(
                 "[init] vblank method {}, refresh {:.2} Hz",
@@ -1350,13 +1561,12 @@ impl ApplicationHandler for App {
                     let width = NonZeroU32::new(size.width.max(1)).unwrap();
                     let height = NonZeroU32::new(size.height.max(1)).unwrap();
                     surface.resize(context, width, height);
-                    gl.viewport(0, 0, size.width as i32, size.height as i32);
+                    gfx::viewport(gl, 0, 0, size.width as i32, size.height as i32);
                     // Re-warm the RDS base field at the new size while outside
                     // the swap loop. `rds_texture` rebuilds lazily on the first
                     // draw after a size change; doing that inside the live swap
-                    // loop de-phases the shutter packets on scene switch (see
-                    // the KMS warm comment). No-op when the cached texture
-                    // already matches this size.
+                    // loop de-phases the shutter packets on scene switch. No-op
+                    // when the cached texture already matches this size.
                     medimg::warm(gl, size.width.max(1) as i32, size.height.max(1) as i32);
                 }
             }
@@ -1378,294 +1588,10 @@ impl ApplicationHandler for App {
     }
 }
 
-
-/// RAII guard that restores the `NVSTUSB_DRM`/`NVSTUSB_DRM_CARD` process env
-/// vars to their prior state on drop. The KMS backend sets them (right before
-/// `nvstusb::init()`) so `init()` selects the DRM vblank anchor (method 4);
-/// if `run_kms` returns `Err` at any point after that, this guarantees the
-/// vars cannot leak into the windowed fallback's own `init()`, which would
-/// otherwise force method 4 onto a composited surface and cause wrong-eye
-/// flicker. On the KMS success path `run_kms` runs until the user quits, so
-/// the guard only drops as the process exits.
-struct DrEnvGuard {
-    drm: Option<std::ffi::OsString>,
-    card: Option<std::ffi::OsString>,
-}
-
-impl DrEnvGuard {
-    fn capture() -> DrEnvGuard {
-        DrEnvGuard {
-            drm: std::env::var_os("NVSTUSB_DRM"),
-            card: std::env::var_os("NVSTUSB_DRM_CARD"),
-        }
-    }
-}
-
-impl Drop for DrEnvGuard {
+impl Drop for App {
     fn drop(&mut self) {
-        match &self.drm {
-            Some(v) => std::env::set_var("NVSTUSB_DRM", v),
-            None => std::env::remove_var("NVSTUSB_DRM"),
-        }
-        match &self.card {
-            Some(v) => std::env::set_var("NVSTUSB_DRM_CARD", v),
-            None => std::env::remove_var("NVSTUSB_DRM_CARD"),
-        }
+        // Fields are alive here; drops happen after. Nothing custom needs
+        // doing (the past clock/present machinery was removed).
     }
 }
 
-/// Direct-KMS frame pump. Renders straight to the display engine via GBM/EGL
-/// and DRM page flips, so the present vblank is the vblank we predicted. Keys
-/// are read from the controlling tty (raw mode); `,`/`.`/`[`/`]`
-/// adjust shutter sync live, `q` quits.
-fn run_kms(no_emitter: bool) -> Result<(), String> {
-    if no_emitter {
-        return Err("KMS mode requires the IR emitter to drive shutter timing".into());
-    }
-    // Restore DRM env vars on any error so the windowed fallback never picks
-    // up method 4 from a failed KMS attempt.
-    let _env_guard = DrEnvGuard::capture();
-
-    // Take over the display and establish the mode FIRST: the DRM vblank
-    // anchor (below) probes for a CRTC running at ~120 Hz, which only exists
-    // after our SETCRTC. On a bare VT the projector's CRTC is otherwise off.
-    // NOTE: `NVSTUSB_DRM` is NOT set here. It is only set below, right before
-    // `nvstusb::init()`, i.e. only once we have committed to the KMS backend.
-    // Setting it earlier (before the fallible open) would leak it into the
-    // windowed fallback's `init()` via the process environment and force
-    // vblank method 4 (DRM anchor) onto a composited surface -> wrong-eye
-    // flicker.
-    let mut kms = KmsDisplay::open()?;
-    let gw = kms.width as i32;
-    let gh = kms.height as i32;
-    eprintln!(
-        "[kms] display {}x{} @ {} Hz on {}",
-        kms.width, kms.height, kms.mode.vrefresh, kms.card_path
-    );
-
-    kms.make_current()?;
-    let gl = Gl::load_with(|symbol| {
-        let cstr = std::ffi::CString::new(symbol).unwrap();
-        kms.get_proc_address(cstr.as_ptr())
-    });
-
-    // Set up OpenGL state (mirrors the windowed path).
-    gl.clear_color(0.0, 0.0, 0.0, 1.0);
-    gl.enable(gl::DEPTH_TEST);
-    gl.shade_model(gl::SMOOTH);
-    gl.enable(gl::COLOR_MATERIAL);
-    gl.color_material(gl::FRONT_AND_BACK, gl::AMBIENT_AND_DIFFUSE);
-    gl.viewport(0, 0, gw, gh);
-    screenshot::init(&gl);
-
-    // Frame 0: SETCRTC to make the projector's CRTC live at the chosen mode.
-    // Synchronous, so the vblank clock is running before the anchor probes it.
-    gl.clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
-    let _ = kms.present().map_err(|e| format!("initial mode-set failed: {e}"))?;
-    eprintln!("[kms] mode set, CRTC live");
-
-    // Now init the emitter + DRM vblank anchor. Force the anchor onto the card
-    // we just mode-set (its CRTC is the one running at ~120 Hz), falling back
-    // to the card scan if it proves unusable. `NVSTUSB_DRM` is set only now,
-    // after the KMS surface is live, so it cannot leak into any fallback path.
-    std::env::set_var("NVSTUSB_DRM", "1");
-    std::env::set_var("NVSTUSB_DRM_CARD", &kms.card_path);
-    let mut nv_ctx = nvstusb::init().ok_or("nvstusb init failed")?;
-    if nv_ctx.vblank_method() != 4 {
-        return Err("KMS mode requires NVSTUSB_DRM=1 (vblank method 4)".into());
-    }
-    // Re-anchor the vblank prediction at the real mode rate before the first
-    // report, so it never shows 0.00 Hz.
-    nv_ctx.set_rate(kms.mode.vrefresh as f32);
-    nv_ctx.force_resync();
-    eprintln!("[kms] vblank method {}, refresh {:.2} Hz", nv_ctx.vblank_method(), nv_ctx.rate());
-    // Tell the emitter sync code the *actual* observed eglSwapInterval(0)
-    // behavior instead of always assuming the driver rejected it (see
-    // nvstusb::swap, method 4). Ghosting on both eyes is the classic symptom
-    // of getting this backwards - the wrong eye's shutter fires every frame.
-    // The readback is authoritative now: the interval request moved into
-    // `make_current`, where a current context makes it valid (calling it
-    // pre-context made Mesa reject ANY value with EGL_BAD_PARAMETER, which
-    // we misread as "GBM always throttles"). The measured present error
-    // still re-decides within a second or two of steady frames (see
-    // nvstusb::NvstusbContext::update_kms_inversion).
-    nv_ctx.set_kms_vsync_throttled(kms.vsync_throttled());
-    eprintln!(
-        "[kms] provisional eye inversion = {} (from eglSwapInterval(0) readback; re-derived from present err)",
-        if nv_ctx.kms_eye_inverted() {
-            "ON"
-        } else {
-            "OFF"
-        }
-    );
-
-    if let Some(raw) = std::env::var_os("NVSTUSB_DELAY_US") {
-        if let Ok(s) = raw.into_string() {
-            if let Ok(v) = s.parse::<u32>() {
-                nv_ctx.set_alarm_delay_us(v);
-                println!("Set IR alarm delay to {v} us");
-            }
-        }
-    }
-    if let Some(raw) = std::env::var_os("NVSTUSB_PHASE_US") {
-        if let Ok(s) = raw.into_string() {
-            if let Ok(v) = s.parse::<u32>() {
-                nv_ctx.set_swap_phase_us(v);
-                println!("Set IR phase delay to {v} us");
-            }
-        }
-    }
-
-    let mut cam = Camera::default();
-    cam.camera_type = CameraType::ParallelAxisAsymmetric;
-    cam.eye = Vec3::new(39.0, 53.0, 22.0);
-    cam.look = Vec3::new(0.0, 0.0, 0.0);
-    cam.up = Vec3::new(0.0, 1.0, 0.0);
-    cam.focal = 70.0;
-    cam.fov = 50.0;
-    cam.iod = cam.focal / 30.0;
-    cam.near = 1.0;
-    cam.far = 200.0;
-
-    // Raw-mode stdin key reader. Ctrl+C is disabled in raw mode, so `q` is the
-    // only clean exit (the shell restores termios on process exit anyway).
-    let (ktx, krx) = std::sync::mpsc::channel::<u8>();
-    let _raw = TtyKeys::enter();
-    std::thread::spawn(move || {
-        let mut b = [0u8; 1];
-        loop {
-            if unsafe { read_tty(0, b.as_mut_ptr() as *mut c_void, 1) } != 1 {
-                break;
-            }
-            if ktx.send(b[0]).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Warm the one-shot scene assets (medimg's base-dot texture, pulsar's
-    // display list) while the flip clock is quiet. Building them lazily at a
-    // mid-run scene switch stalls this strict KMS loop for ~100 ms in a debug
-    // build and permanently de-phases the VT shutters (~112 Hz sub-harmonic).
-    medimg::warm(&gl, gw, gh);
-    pulsar::warm(&gl);
-
-    let mut app = App {
-        window: None,
-        gl_surface: None,
-        gl_context: None,
-        gl: Some(gl),
-        nv_ctx: Some(nv_ctx),
-        kms: Some(kms),
-        cam,
-        gw,
-        gh,
-        force_eye: 0,
-        current_eye: 0,
-        rds_depth: medimg::DEFAULT_DEPTH_PX,
-        rds_bg: medimg::DEFAULT_BG_SHIFT,
-        scene: SceneMode::default(),
-        pulsar_angle: 0.0,
-        pulsar_rotate: true,
-        no_emitter: false,
-        alarm_delay_us: 0,
-        swap_phase_us: 75,
-        last_frame_time: None,
-        frame_stats: FrameStats::default(),
-        last_swap_ret: None,
-        swap_stats: FrameStats::default(),
-        frame_accum: FrameAccum::default(),
-        perf_due: false,
-        app_start: Instant::now(),
-        last_monitor_name: None,
-    };
-    if let Some(ctx) = app.nv_ctx.as_ref() {
-        app.swap_phase_us = ctx.swap_phase_us();
-    }
-
-    let mut quit = false;
-    while !quit {
-        while let Ok(b) = krx.try_recv() {
-            if app.process_key(b as char) {
-                quit = true;
-            }
-        }
-        if quit {
-            break;
-        }
-        app.render_once();
-    }
-    eprintln!("nvstusb: KMS loop exiting");
-    Ok(())
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-const ICANON: u32 = 0o0000002;
-const ECHO: u32 = 0o0000010;
-const ISIG: u32 = 0o0000001;
-const VMIN: usize = 6;
-const VTIME: usize = 5;
-const TCSANOW: c_int = 0;
-
-unsafe extern "C" {
-    fn isatty(fd: c_int) -> c_int;
-    fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
-    fn tcsetattr(fd: c_int, a: c_int, t: *const Termios) -> c_int;
-    #[link_name = "read"]
-    fn read_tty(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-}
-
-/// Puts the controlling tty in raw-ish mode (no line buffering, no echo) and
-/// restores it on drop. No-op when stdin is not a tty (e.g. piped input).
-struct TtyKeys {
-    orig: Termios,
-}
-
-impl TtyKeys {
-    fn enter() -> Option<TtyKeys> {
-        if unsafe { isatty(0) } != 1 {
-            return None;
-        }
-        let mut t = Termios {
-            c_iflag: 0,
-            c_oflag: 0,
-            c_cflag: 0,
-            c_lflag: 0,
-            c_line: 0,
-            c_cc: [0; 32],
-            c_ispeed: 0,
-            c_ospeed: 0,
-        };
-        if unsafe { tcgetattr(0, &mut t) } != 0 {
-            return None;
-        }
-        let orig = t;
-        t.c_lflag &= !(ICANON | ECHO | ISIG);
-        t.c_cc[VMIN] = 1;
-        t.c_cc[VTIME] = 0;
-        if unsafe { tcsetattr(0, TCSANOW, &t) } != 0 {
-            return None;
-        }
-        Some(TtyKeys { orig })
-    }
-}
-
-impl Drop for TtyKeys {
-    fn drop(&mut self) {
-        unsafe {
-            tcsetattr(0, TCSANOW, &self.orig);
-        }
-    }
-}

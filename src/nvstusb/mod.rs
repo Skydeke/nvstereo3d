@@ -2,27 +2,18 @@
 //!
 //! Port of `lib/nvstusb.c` from the original C project. Talks to the emitter
 //! through [`usb`], and keeps the shutter timing in sync with the display by
-//! either waiting on GLX video sync, forcing a swap interval, or doing a
-//! software vblank wait (reading back the front buffer).
+//! pacing the eye packet to the DRM/KMS kernel vblank clock (see [`drm`]).
 #![allow(dead_code)]
 
 pub mod drm;
-pub mod glx;
-pub mod kms;
 pub mod usb;
-pub mod wayland;
-pub mod x11glx;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::gl;
-use crate::nvstusb::drm::DrmVblank;
-use crate::nvstusb::glx::GlxExtensions;
-use crate::nvstusb::usb::{t2_count, UsbDevice};
+use crate::nvstusb::drm::{normalize_connector_name, DrmVblank};
+use crate::nvstusb::usb::{t2_count, timings_block, UsbDevice};
 
 /// Debug timing accumulators for the per-frame swap path.  Filled in
 /// `set_eye()` (swap-packet USB write) and `swap()` (vblank wait); the main
@@ -41,12 +32,6 @@ static DBG_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
 static DRM_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static DRM_PRESENT_TOTAL: AtomicI64 = AtomicI64::new(0);
 static DRM_PRESENT_MAX_ABS: AtomicI64 = AtomicI64::new(0);
-/// Long-running method-4 present-error accumulator used ONLY to auto-decide
-/// whether the eye must be inverted (see `NvstusbContext::update_kms_inversion`).
-/// Deliberately separate from the perf-window `DRM_PRESENT_*` counters so the
-/// once-per-second report reset cannot wipe the decision history.
-static KMS_ERR_TOTAL: AtomicI64 = AtomicI64::new(0);
-static KMS_ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Records a new maximum into an atomic if `us` is larger than the current one.
 fn dbg_update_max(atom: &AtomicU64, us: u64) {
@@ -118,6 +103,126 @@ pub struct Keys {
 
 /// Context for communicating with the NVIDIA 3D Vision IR emitter.
 
+/// One per-monitor shutter timing profile in the units 3DVisionActivator's
+/// `MonitorTimings.ini` (and NV3D-Lib's `nvtimings.json`) uses, all in
+/// microseconds.  The semantics come from the firmware reverse-engineering in
+/// libnvstusb (`src/nvstusb.c` register annotations) plus 3DVisionActivator's
+/// own documentation:
+/// - X: delay from the monitor's refresh start to the shutter open edge (a
+///   T0 timer reload — 4 MHz — "timer 0 will be started with this value by
+///   timer 2"); the primary band-position knob;
+/// - Y: shutter open window, the delay until the eye is turned off ("delay
+///   until turning eye off?" — also a T0 reload);
+/// - Z: full frame time (== 1e6 / refresh rate), the T2 "timer 2 reload
+///   value" that keeps the frame period;
+/// - W: a second T2 timer counter ("some timer 2 counter, 1020 is subtracted
+///   from this, loaded at startup"); a real register that every per-monitor
+///   profile stores, but 3DVisionActivator's author measured "no effect" on
+///   the panels he tried — leave it alone unless your monitor visibly needs
+///   it.
+/// The refresh rate (Z) is fixed per monitor; X/Y/W are the values you tune.
+///
+/// Genuine nvstusb firmware and the RP2040-style clones both implement this
+/// register block (the app probes the read-back to verify X/Y/W writes took
+/// effect — [`crate::nvstusb::NvstusbContext::timings_live`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ShutterTimings {
+    pub x_us: f64,
+    pub y_us: f64,
+    pub z_us: f64,
+    pub w_us: f64,
+}
+
+impl ShutterTimings {
+    /// 1440p @ 120 Hz reference from NV3D-Lib's nvtimings.json — byte-identical
+    /// to the `Samsung LC27G5xT 1440p 120Hz` profile shipped with
+    /// 3DVisionActivator (`MonitorTimings.ini` [0], EDID SAM28794).
+    pub const fn reference() -> Self {
+        Self {
+            x_us: 0.5,
+            y_us: 7334.0,
+            z_us: 8333.5,
+            w_us: 4735.58,
+        }
+    }
+
+    /// Parses a 3DVisionActivator `MonitorTimings.ini` (sections like
+    /// `RefreshRateHz:`, `X_us:`, `Y_us:`, `Z_us:`, `W_us:`) and returns the
+    /// first profile whose refresh rate is within `tol_hz` of `rate_hz` (the
+    /// monitor's measured rate — the demo always binds Z to the real refresh).
+    /// Profiles are matched by refresh rate rather than EDID_ID because the
+    /// app only knows the output/connector name, not the monitor's EDID block.
+    pub fn from_ini_file(path: &str, rate_hz: f32, tol_hz: f32) -> Option<ShutterTimings> {
+        use std::fs;
+
+        let text = fs::read_to_string(path).ok()?;
+        #[derive(Default, Clone, Copy)]
+        struct Entry {
+            rate: Option<f32>,
+            x: Option<f64>,
+            y: Option<f64>,
+            z: Option<f64>,
+            w: Option<f64>,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut cur: Option<Entry> = None;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // A new profile starts at a `Monitor:` line (or a `[n]` / EDID
+            // header). Flush the previous one.
+            if line.starts_with("Monitor:") || line.starts_with("EDID_ID:") || line.starts_with('[')
+            {
+                if let Some(e) = cur.take() {
+                    entries.push(e);
+                }
+                cur = Some(Entry::default());
+            } else if let Some(e) = cur.as_mut() {
+                for (prefix, slot) in [
+                    ("RefreshRateHz:", "rate"),
+                    ("X_us:", "x"),
+                    ("Y_us:", "y"),
+                    ("Z_us:", "z"),
+                    ("W_us:", "w"),
+                ] {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        let rest = rest.trim();
+                        let ok = match slot {
+                            "rate" => rest.parse::<f32>().ok().map(|v| e.rate = Some(v)),
+                            "x" => rest.parse::<f64>().ok().map(|v| e.x = Some(v)),
+                            "y" => rest.parse::<f64>().ok().map(|v| e.y = Some(v)),
+                            "z" => rest.parse::<f64>().ok().map(|v| e.z = Some(v)),
+                            _ => rest.parse::<f64>().ok().map(|v| e.w = Some(v)),
+                        };
+                        if ok.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(e) = cur.take() {
+            entries.push(e);
+        }
+        entries.into_iter().find_map(|e| {
+            let rate_ok = match e.rate {
+                Some(r) => (r - rate_hz).abs() <= tol_hz,
+                None => return None,
+            };
+            (rate_ok && e.x.is_some() && e.y.is_some() && e.z.is_some() && e.w.is_some()).then(
+                || ShutterTimings {
+                    x_us: e.x.unwrap(),
+                    y_us: e.y.unwrap(),
+                    z_us: e.z.unwrap(),
+                    w_us: e.w.unwrap(),
+                },
+            )
+        })
+    }
+}
+
 /// Context for communicating with the NVIDIA 3D Vision IR emitter.
 pub struct NvstusbContext {
     /// Currently configured refresh rate.
@@ -128,202 +233,110 @@ pub struct NvstusbContext {
     device: UsbDevice,
     /// Last toggled 3D state.
     toggled_3d: bool,
-    /// Vblank method: 0 = software, 1 = GLX_SGI_video_sync, 2 = env-var
-    /// synced, 3 = GLX_SGI_swap_control, 4 = DRM/KMS vblank anchor.
-    vblank_method: u8,
-    /// Kernel vblank anchor (method 4), if the DRM device opened.
+    /// Kernel DRM/KMS vblank anchor — the ONLY pacing mechanism.  The IR
+    /// packet is timed to the display engine's own vblank clock (method 4).
     drm_vblank: Option<DrmVblank>,
+    /// Kernel connector name (e.g. `DP-1`) of the display the window is on,
+    /// that the vblank anchor should be bound to.  On a multi-head GPU the
+    /// per-head vblank grids share no fixed phase, so an anchor on the wrong
+    /// head leaves a constant 0..1-frame shutter error (or, with the swap
+    /// coming back on a different grid, a broken frame lock).  Keeping this
+    /// in lockstep with the window's wl_output and re-opening the anchor with
+    /// it is what keeps the anchor on the RIGHT head.  Set via
+    /// [`NvstusbContext::set_target_connector`].
+    target_connector: Option<String>,
     /// Whether the eyes are inverted.
     invert_eyes: bool,
-    /// Last swap interval requested via glXSwapIntervalSGI.
-    current_swap_interval: i32,
-    /// Host-side phase delay (us).  For method 1 this is the delay applied
-    /// after swap_buffers before the next eye packet; for method 4 it is the
-    /// packet lead before the vblank boundary (see swap()).
+    /// Packet lead before the vblank boundary (us), see `swap()`.
     swap_phase_us: u32,
-    /// Stereo thread state.
-    thread_running: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-    /// Resolved GLX extension entry points.
-    glx: GlxExtensions,
-    /// Method 4 only: whether the KMS backend's `eglSwapBuffers` eats an
-    /// extra vblank of throttle, pushing our manual page flip one vblank late
-    /// and requiring the "on_screen" eye inversion in `swap()`.
-    ///
-    /// This is NOT reliably derived from `eglSwapInterval(0)`: on the GBM
-    /// platform that call returns `EGL_BAD_NATIVE_WINDOW` unconditionally
-    /// (swap intervals only apply to window surfaces), so a rejection says
-    /// nothing about whether `eglSwapBuffers` throttles. It is only a
-    /// provisional starting guess; the real decision is re-derived from the
-    /// measured present error by [`Self::update_kms_inversion`].
-    kms_vsync_throttled: bool,
-    /// Method 1, present feedback (OML): instant of the most recent confirmed
-    /// on-screen present and the smoothed interval between presents.
-    present_instant: Option<Instant>,
-    vsync_period_us: u64,
-    /// Method 1, present feedback: app Xlib display pointer and drawable that
-    /// back the GL surface; both zero/unset when unavailable, which disables
-    /// OML attribution and degrades to boundary-only pacing.
-    x11_display: usize,
-    x11_drawable: u64,
-    /// SBC snapshot taken just before each swap (method 1); a later increase
-    /// in the OML swap-block counter confirms the buffer actually reached the
-    /// screen.
-    pre_swap_sbc: i64,
-    /// Whether a swap is awaiting present confirmation.
-    pending_confirm: bool,
-    /// Return instant of the swap before last (method 1), for gap anomalies.
-    prev_swap_return: Option<Instant>,
-    /// Wayland/EGL present clock (method 1 on native Wayland): a private EGL
-    /// display (the same singleton the app's EGL uses) plus a shadow window
-    /// surface over the app's `wl_surface`, used only to read the hardware
-    /// vblank counter via `eglGetSyncValuesCHROMIUM`.  Never rendered to and
-    /// never swapped, so it cannot interfere with the app's buffers.
-    egl_clock: Option<EglClock>,
-    /// Kernel DRM vblank clock (method 1 on native Wayland): true hardware
-    /// boundary timestamps straight from WAIT_VBLANK, no DRM master needed.
-    /// Anchoring packets to this grid removes the ppm-level beat between the
-    /// compositor's callback clock and the display crystal, which made the
-    /// flip point sweep through the frame (seen as a red->blue gradient).
-    drm_clock: Option<DrmVblank>,
-    /// Whether the lazy DRM probe already ran (avoids retry spam).
-    drm_tried: bool,
-    /// Normalized name of the output (wl_output / kernel connector) the app
-    /// window is currently displayed on, e.g. `dp-1`. The method-1 kernel
-    /// anchor is (re-)opened on the CRTC serving THAT output; on a multi-head
-    /// GPU each head's vblank grid has an arbitrary phase offset to its
-    /// siblings, so anchoring to the wrong one shifts the IR flip into the
-    /// scanout - visible through shutter glasses as a top/bottom colour split.
-    /// `None` = unknown (blind first-pipe behavior).
-    target_connector: Option<String>,
-    /// Runtime anchor-pipe override cycled by the demo's `o` key:
-    /// 0 = auto (window output / first active head), 1..=8 = CRTC pipe
-    /// index 0..=7. Exists for drivers that refuse connector enumeration to
-    /// plain clients (nvidia-drm without DRM master): there the name binding
-    /// cannot engage and only the user's eyes can pick the right vblank grid.
-    pipe_cycle: u32,
-    /// Return instant of the previous swap (method 1), for gap anomalies.
-    last_swap_return: Option<Instant>,
-    /// Boundary the previous packet was scheduled against (target + lead).
-    /// Used to tell "packet slipped to a later boundary together with the
-    /// throttled present" (render stall - pairing survives on its own) apart
-    /// from "packet stayed on schedule but content lost a cycle" (compositor
-    /// hiccup - glasses must hold via suppression).
-    last_packet_boundary: Option<Instant>,
-    /// Set when a swap-gap anomaly shows content held an extra boundary;
-    /// suppresses one packet so the glasses hold in lockstep.
-    suppress_next_packet: bool,
-    /// Number of `swap()` calls made. Used to let the lazy method-1 kernel
-    /// anchor fall back to the old first-active-head blind scan after a short
-    /// grace period when the window's output is never reported (compositors
-    /// without working wl_output), instead of arming blind on whatever pipe is
-    /// index 0 immediately at startup - on a multi-head GPU that fires the
-    /// first ~hundred packets off the WRONG head's vblank grid and then
-    /// re-targets, which reads as the left/right eyes flashing a couple of
-    /// times right after launch.
-    swap_calls: u64,
+    /// Per-monitor shutter-timing profile (3DVisionActivator / NV3D-Lib
+    /// "X/Y/W" model): X = delay from monitor refresh start to the shutter
+    /// open edge (us), Y = shutter open window (us), W = unused on most
+    /// panels (us).  Z (frame time) always follows [`Self::rate`], so the
+    /// refresh is fixed and X/Y/W are the live-tuned values.  Written to the
+    /// emitter's 0x2007 timing registers by `set_shutter_timings`.
+    timing_x_us: f64,
+    timing_y_us: f64,
+    timing_w_us: f64,
+    /// Whether the emitter was verified to store the 0x2007 shutter-timing
+    /// register block (X/Y/W): `None` = not probed yet, `Some(true)` = the
+    /// device echoed the block back with the values that were just written
+    /// (X/Y/W tuning is live), `Some(false)` = the write-back could NOT be
+    /// verified (readback silent or echoed mismatched values — the block may
+    /// still be implemented by a device that answers the read late).  A failed
+    /// readback is deliberately not labelled "ignored": silence is not proof
+    /// that X/Y/W writes have no effect.  See
+    /// [`NvstusbContext::timings_live`].
+    timings_live: Option<bool>,
 }
 
 /// How many swaps to wait for the window's wl_output to be reported before the
-/// method-1 anchor gives up and does the old first-active-head blind scan.
+/// vblank anchor gives up and does the old first-active-head blind scan.
 pub(crate) const ARM_GRACE_SWAPS: u64 = 240;
 
-/// Runtime-loaded EGL entry points + handles backing [`NvstusbContext::egl_clock`].
-struct EglClock {
-    dpy: usize,
-    surf: usize,
-    get_sync_values: unsafe extern "C" fn(
-        dpy: usize,
-        surface: usize,
-        ust: *mut i64,
-        msc: *mut i64,
-        sbc: *mut i64,
-    ) -> u32,
+/// Decides whether the DRM vblank anchor must be re-armed onto the window's
+/// output.  Re-arming is needed when the window's output is known and the
+/// anchor is bound to a DIFFERENT connector (or to no connector at all - a
+/// blind first-active-head bind whose head may not be the window's).
+///
+/// This is the single most important correctness check for multi-head pacing:
+/// on a multi-head GPU every CRTC vblank grid runs at an arbitrary fixed phase
+/// to its siblings, so an anchor left on the wrong head free-runs at the same
+/// refresh with a stable-but-wrong phase - the shutter flips mid-scanout (a
+/// red/blue split on the alternating-colour scene) and, worst case, the frame
+/// lock never converges.  A windowed window can be dragged across monitors (or
+/// moved by compositor keybinds), so this must be re-evaluated repeatedly.
+fn needs_anchor_retarget(anchor_connector: Option<&str>, window_connector: Option<&str>) -> bool {
+    let Some(want) = window_connector else {
+        // Window's output not yet reported (boot): leave the anchor where it
+        // is; `ARM_GRACE_SWAPS` bounds how long we tolerate the possibly-wrong
+        // head before the demo re-checks.
+        return false;
+    };
+    match anchor_connector {
+        // Anchor explicitly on the window's head (or the connector is
+        // unknown/empty but the window's name is too): nothing to do.
+        Some(anchor) if anchor == want => false,
+        // Anchor is on some OTHER named head -> wrong head, must re-arm.
+        Some(_) => true,
+        // Anchor bound blind (no connector matched) -> assume wrong until the
+        // window's output is learned and proven to match.
+        None => true,
+    }
 }
 
 /// Initializes the controller: opens the USB device (uploading `nvstusb.fw`
-/// first if needed) and picks a vblank synchronization method.
+/// first if needed) and picks the DRM vblank anchor.
 pub fn init() -> Option<NvstusbContext> {
     let usb_context = usb::usb_init()?;
     let device = usb::open_device(usb_context, include_bytes!("../../firmware/nvstusb.fw"))?;
 
-    let glx = GlxExtensions::load();
-
-    // Method 4: anchor the IR to the kernel's real vblank (see drm.rs).
-    // Selected when NVSTUSB_DRM=1 (set by the KMS backend only after it has
-    // taken the display); on failure we fall back to the normal pick.
-    let mut drm_vblank = None;
-    let vblank_method = if std::env::var_os("NVSTUSB_DRM").is_some() {
-        match DrmVblank::open() {
-            Some(d) => {
-                drm_vblank = Some(d);
-                4
-            }
-            None => {
-                eprintln!("nvstusb: NVSTUSB_DRM requested but DRM anchor failed; falling back");
-                0
-            }
-        }
-    } else if std::env::var_os("__GL_SYNC_TO_VBLANK").is_some() {
-        eprintln!("__GL_SYNC_TO_VBLANK defined in environment");
-        2
+    // DRM/KMS vblank anchor: the ONLY pacing mechanism (method 4). Timed to the
+    // display engine's real vblank clock (see drm.rs).
+    let drm_vblank = if std::env::var_os("NVSTUSB_DRM").is_some() {
+        DrmVblank::open()
     } else {
-        let mut method = 0;
-        if glx.swap_interval_sgi.is_some() {
-            eprintln!("nvstusb: forcing vsync");
-            method = 3;
-        }
-        if glx.wait_video_sync_sgi.is_some() {
-            if glx.get_video_sync_sgi.is_some() {
-                eprintln!("nvstusb: GLX_SGI_video_sync supported!");
-            }
-            method = 1;
-        }
-        method
+        None
     };
-    eprintln!("nvstusb:selected vblank method: {}", vblank_method);
+    if drm_vblank.is_none() {
+        eprintln!("nvstusb: no DRM vblank anchor; NVSTUSB_DRM must be set");
+    }
 
-    let swap_phase_us = match vblank_method {
-        // Method 4: host lead before the boundary (~USB write time).
-        4 => 75,
-        // Method 1 (GLX video sync): lead of the eye packet before the next
-        // vblank boundary. The firmware fires the IR one alarm delay
-        // (3000 us) after arrival, so 3100 us puts the shutter flip ~100 us
-        // ahead of the boundary - the same fixed lead the NVIDIA driver
-        // kept. Sweep with `,`/`.`.
-        _ => 3100,
-    };
+    let swap_phase_us = 3100;
 
     Some(NvstusbContext {
         rate: 0.0,
         eye: Eye::Left,
         device,
         toggled_3d: false,
-        vblank_method,
         drm_vblank,
-        invert_eyes: false,
-        current_swap_interval: -1,
-        swap_phase_us,
-        thread_running: Arc::new(AtomicBool::new(false)),
-        thread: None,
-        glx,
-        kms_vsync_throttled: true,
-        present_instant: None,
-        vsync_period_us: 8333,
-        x11_display: 0,
-        x11_drawable: 0,
-        pre_swap_sbc: -1,
-        pending_confirm: false,
-        prev_swap_return: None,
-        egl_clock: None,
-        drm_clock: None,
-        drm_tried: false,
         target_connector: None,
-        pipe_cycle: 0,
-        last_swap_return: None,
-        last_packet_boundary: None,
-        suppress_next_packet: false,
-        swap_calls: 0,
+        invert_eyes: false,
+        swap_phase_us,
+        timing_x_us: ShutterTimings::reference().x_us,
+        timing_y_us: ShutterTimings::reference().y_us,
+        timing_w_us: ShutterTimings::reference().w_us,
+        timings_live: None,
     })
 }
 
@@ -341,8 +354,98 @@ impl NvstusbContext {
         if let Err(e) = self.device.configure(rate) {
             eprintln!("nvstusb: emitter configure failed: {e}");
         }
+        // `configure` programs the reference shutter timings; re-apply the
+        // current (possibly live-tuned, per-monitor) X/Y/W profile so a
+        // monitor-change re-config never resets the user's tuning.
+        if let Err(e) =
+            self.device
+                .set_timings_us(rate, self.timing_x_us, self.timing_y_us, self.timing_w_us)
+        {
+            eprintln!("nvstusb: shutter timing write failed: {e}");
+        }
+
+        // Verify the timing registers actually took effect, exactly like the
+        // 3DVisionActivator write-back check: the device echoes the 0x2007
+        // block when it stores it.  Probed once (with read retries for
+        // stale/late responses) — later re-configs do not re-slow startup.
+        if self.timings_live.is_none() {
+            self.timings_live = Some(self.probe_timings_live(rate));
+        }
 
         self.rate = rate;
+    }
+
+    /// Asks the emitter to echo the shutter-timing registers it has stored,
+    /// mirroring 3DVisionActivator's post-write verification, then checks that
+    /// the echoed X/Y/W/Z reload counts are the ones just written.  Returns
+    /// `true` only when the device answered with the 28-byte register block
+    /// *and* the echoed values match the last profile written — that is the
+    /// evidence that the X/Y/W tuning genuinely reaches the timing generator.
+    ///
+    /// A `false` result is deliberately reported as "unverified", never as
+    /// "ignored": an empty readback proves only that the device did not answer
+    /// the probe, not that the 0x2007 block is unimplemented (emitters known
+    /// to implement it can still answer late or be shadowed by a stale
+    /// control-in response from an earlier session).
+    fn probe_timings_live(&self, rate: f32) -> bool {
+        // Expected reload counts: `configure`/`set_timings_us` just stored
+        // exactly this block (timings_block clamps sub-60 Hz rates to 120 Hz,
+        // mirroring configure's own use).
+        let block = timings_block(rate, self.timing_x_us, self.timing_y_us, self.timing_w_us);
+        let le = |i: usize| {
+            (block[i] as i32)
+                | (block[i + 1] as i32) << 8
+                | (block[i + 2] as i32) << 16
+                | (block[i + 3] as i32) << 24
+        };
+        // w/x/y/z live at payload offsets 0/4/8/20 of the written block.
+        let expect = [le(4), le(8), le(12), le(24)];
+
+        match self.device.read_timings_registers() {
+            Some(back) => {
+                if back == expect {
+                    eprintln!(
+                        "nvstusb: timing registers read back and verified (w={} x={} y={} \
+                         z={} counts); X/Y/W tuning is LIVE on this emitter",
+                        back[0], back[1], back[2], back[3]
+                    );
+                    true
+                } else {
+                    eprintln!(
+                        "nvstusb: timing block read back but does not match what was written \
+                         (w={} x={} y={} z={}, expected w={} x={} y={} z={}); X/Y/W \
+                         write-back unverified",
+                        back[0],
+                        back[1],
+                        back[2],
+                        back[3],
+                        expect[0],
+                        expect[1],
+                        expect[2],
+                        expect[3]
+                    );
+                    false
+                }
+            }
+            None => {
+                eprintln!(
+                    "nvstusb: no timing-register readback (the 0x2007 block read was tried \
+                     several times and always came back empty or short); the timing write-back \
+                     could not be verified"
+                );
+                false
+            }
+        }
+    }
+
+    /// Whether the shutter-timing register block (X/Y/W via
+    /// [`Self::set_shutter_timings`]) was verified to be honored by this
+    /// emitter: `None` = not probed yet, `Some(true)` = live (the device
+    /// echoed the block back with the written values), `Some(false)` =
+    /// readback unverified (the block may still be implemented — see
+    /// [`Self::probe_timings_live`]).
+    pub fn timings_live(&self) -> Option<bool> {
+        self.timings_live
     }
 
     /// Sets the RP2040 clone's packet -> IR delay in microseconds (control
@@ -372,6 +475,38 @@ impl NvstusbContext {
         self.swap_phase_us
     }
 
+    /// Per-monitor shutter timing X (us): delay from monitor refresh start to
+    /// the shutter open edge.  Primary band-position knob, tuned live with
+    /// the demo's `,`/`.`/`[`/`]` keys.
+    pub fn timing_x_us(&self) -> f64 {
+        self.timing_x_us
+    }
+
+    /// Per-monitor shutter timing Y (us): shutter open window.
+    pub fn timing_y_us(&self) -> f64 {
+        self.timing_y_us
+    }
+
+    /// Per-monitor shutter timing W (us): unused on most panels.
+    pub fn timing_w_us(&self) -> f64 {
+        self.timing_w_us
+    }
+
+    /// Programs the emitter's shutter-timing registers (X/Y/W, microseconds)
+    /// live and remembers them so a later `set_rate` re-applies them.  This
+    /// is the 3DVisionActivator / NV3D-Lib per-monitor tuning step: X = delay
+    /// from monitor refresh start to the shutter open edge, Y = shutter open
+    /// window, W = unused.  Z (frame time) always follows the refresh rate.
+    pub fn set_shutter_timings(&mut self, x_us: f64, y_us: f64, w_us: f64) {
+        let rate = if self.rate > 60.0 { self.rate } else { 120.0 };
+        self.timing_x_us = x_us;
+        self.timing_y_us = y_us;
+        self.timing_w_us = w_us;
+        if let Err(e) = self.device.set_timings_us(rate, x_us, y_us, w_us) {
+            eprintln!("nvstusb: shutter timing write failed: {e}");
+        }
+    }
+
     /// Sets the host-side packet lead (us).  Method 1 sends the eye packet
     /// this many microseconds before the next vblank boundary, so the IR
     /// flip lands at `boundary - lead + alarm delay`; `,`/`.` tuning moves
@@ -380,140 +515,67 @@ impl NvstusbContext {
         self.swap_phase_us = us;
     }
 
-    /// Names the active method-1 pacing anchor for diagnostics. Includes the
-    /// anchored display (`DP-1/pipe1`) so a wrong-head bind is visible in the
-    /// once-per-second perf report.
-    pub fn anchor_name(&self) -> String {
-        if let Some(d) = self.drm_clock.as_ref() {
-            format!("drm-vblank[{}]", d.label())
-        } else if let Some(d) = self.drm_vblank.as_ref() {
-            format!("drm-vblank[{}]", d.label())
-        } else if self.egl_clock.is_some() {
-            "egl-msc".to_string()
-        } else if self.x11_display != 0 {
-            "oml-sbc".to_string()
-        } else {
-            "swap-return".to_string()
-        }
-    }
-
-    /// Tells the context which output (wl_output name == kernel connector
-    /// name, e.g. `DP-1`) the app window is displayed on, so the kernel
-    /// vblank anchor can be bound to that head's CRTC instead of whatever
-    /// pipe happens to be index 0 on a multi-monitor GPU.
+    /// Re-targets the DRM vblank anchor to the kernel connector the window is
+    /// now on (e.g. `DP-1`), re-opening it with the window's output as the
+    /// preferred connector.  On a multi-head GPU the per-head vblank grids are
+    /// phase-independent, so this is REQUIRED to keep the shutter locked to the
+    /// display actually showing our window - an anchor left on the other head's
+    /// grid free-runs at the same refresh but with an arbitrary phase, so the
+    /// shutter flips mid-scanout and the frame lock breaks.
     ///
-    /// Called again whenever the window moves to another output; that drops
-    /// the current anchor and re-opens it on the new CRTC at the next frame.
+    /// Re-opening swaps in a freshly measured period for the new head (it is
+    /// `resync`-able immediately, `frame_start` re-anchors until synced), so
+    /// the next frame already runs on the new head's grid.  A no-op when the
+    /// connector is unchanged, so the per-frame monitor poll does not churn
+    /// the anchor.
     pub fn set_target_connector(&mut self, name: Option<&str>) {
-        let norm = name.map(crate::nvstusb::drm::normalize_connector_name);
+        let norm = name.map(normalize_connector_name);
         if norm == self.target_connector {
             return;
         }
-        eprintln!(
-            "nvstusb: window output {:?} -> {:?}; re-targeting vblank anchor",
-            self.target_connector.as_deref(),
-            norm.as_deref(),
-        );
-        self.target_connector = norm;
-        // Only the lazy method-1 clock follows the window; the KMS path's
-        // `drm_vblank` is bound at init to the card we mode-set ourselves.
-        if self.drm_clock.take().is_some() {
-            eprintln!(
-                "nvstusb: dropped DRM vblank anchor; re-opening on the new CRTC \
-                 (one-frame hiccup expected)"
-            );
-        }
-        self.drm_tried = false;
-        // The new CRTC's vblank grid is an unrelated timeline: forget which
-        // boundary the previous packet rode on so the next frame can't be
-        // misread as a slipped-together render stall.
-        self.last_packet_boundary = None;
-    }
-
-    /// Runtime escape hatch for the demo's `o` key: steps
-    /// auto -> pipe0 -> pipe1 ... -> pipe7 -> auto. Each press drops and
-    /// re-opens the kernel vblank anchor on the next CRTC pipe, so on drivers
-    /// that hide connector names from plain clients (nvidia-drm without DRM
-    /// master) the user can still move the IR flip onto the head that is
-    /// actually showing the window - watch the blue/red scene, stop when the
-    /// split disappears. No-op outside vblank method 1 (nothing else uses the
-    /// lazy `drm_clock`).
-    pub fn cycle_anchor_pipe(&mut self) {
-        if self.vblank_method != 1 {
+        // Only re-arm when the anchor is actually on the wrong (or no) head.
+        // On a single monitor `open()` already binds to the window's output,
+        // so the first per-frame poll must NOT cause a needless re-open
+        // (a re-open re-measures the period and, at worst, churns the phase).
+        let anchor_conn = self
+            .drm_vblank
+            .as_ref()
+            .and_then(|d| d.connector_name())
+            .map(normalize_connector_name);
+        if !needs_anchor_retarget(anchor_conn.as_deref(), norm.as_deref()) {
+            // Anchor already on the right head; just remember the target so
+            // the poll does not re-run this branch.
+            self.target_connector = norm.clone();
             return;
         }
-        self.pipe_cycle = (self.pipe_cycle + 1) % 9;
-        let label = if self.pipe_cycle == 0 {
-            "auto".to_string()
-        } else {
-            format!("pipe{}", self.pipe_cycle - 1)
-        };
-        eprintln!("nvstusb: anchor pipe override -> {label}");
-        if self.drm_clock.take().is_some() {
-            eprintln!("nvstusb: re-opening the anchor (one-frame hiccup expected)");
-        }
-        self.drm_tried = false;
-        // The new CRTC's vblank grid is an unrelated timeline: forget which
-        // boundary the previous packet rode on so the next frame can't be
-        // misread as a slipped-together render stall.
-        self.last_packet_boundary = None;
+        let old = self.anchor_name();
+        self.target_connector = norm.clone();
+        // Keep pacing live even while the anchor re-opens: open on the new
+        // head (or fall back to the first active head if the new one cannot
+        // be bound), so we never drop to "no-anchor" on a transient monitor
+        // report.
+        let reopened = norm
+            .as_deref()
+            .and_then(|_| DrmVblank::open_preferring(norm.as_deref(), None));
+        self.drm_vblank = reopened.or_else(|| DrmVblank::open());
+        let new = self.anchor_name();
+        eprintln!("nvstusb: anchor re-target {:?} -> {new} (was {old})", norm);
     }
 
-    /// Installs the app's Xlib display + drawable so method 1 can read OML
-    /// sync values (`glXGetSyncValuesOML`) for the *real* GL surface.  The
-    /// SBC from that call is what lets the paced stream follow actual
-    /// on-screen presents instead of raw vblank ticks - required on a
-    /// composited desktop, where the compositor can delay or repeat a frame.
-    /// Call once per process, after the window exists; without it method 1
-    /// falls back to pacing against video-sync boundaries only.
-    pub fn set_x11_target(&mut self, display: usize, drawable: u64) {
-        if display == 0 || drawable == 0 {
-            return;
-        }
-        self.x11_display = display;
-        self.x11_drawable = drawable;
-        eprintln!(
-            "nvstusb: present feedback armed (OML sync values on drawable {:#x})",
-            drawable
-        );
-    }
-
-    /// Arms the Wayland/EGL present clock: opens the EGL display singleton
-    /// for the app's `wl_display` and creates a shadow window surface over
-    /// the app's `wl_surface`, used purely to read the hardware vblank
-    /// counter (`eglGetSyncValuesCHROMIUM`).  The shadow surface is never
-    /// rendered into nor swapped, so it does not touch the app's buffer
-    /// queue.  On failure the field stays unset and pacing degrades to the
-    /// swap-return anchor.
-    pub fn set_wayland_target(&mut self, wl_display: usize, wl_surface: usize) {
-        if wl_display == 0 || wl_surface == 0 || self.egl_clock.is_some() {
-            return;
-        }
-        match unsafe { egl_clock_new(wl_display, wl_surface) } {
-            Ok(clock) => {
-                eprintln!(
-                    "nvstusb: present clock armed (EGL sync values, shadow surface {:#x})",
-                    wl_surface
-                );
-                self.egl_clock = Some(clock);
-            }
-            Err(e) => {
-                if self.drm_clock.is_some() {
-                    eprintln!(
-                        "nvstusb: EGL present clock unavailable ({e}); \
-                         kernel vblank anchor active"
-                    );
-                } else {
-                    eprintln!("nvstusb: EGL present clock unavailable ({e}); using swap anchor");
-                }
-            }
+    /// Names the active pacing anchor for diagnostics (the DRM/KMS vblank
+    /// anchor — always). Includes the anchored display (`DP-1/pipe1`) so a
+    /// wrong-head bind is visible in the once-per-second perf report.
+    pub fn anchor_name(&self) -> String {
+        match self.drm_vblank.as_ref() {
+            Some(d) => format!("drm-vblank[{}]", d.label()),
+            None => "no-anchor".to_string(),
         }
     }
 
-    /// Selected vblank method (0 = software, 1 = GLX_SGI_video_sync,
-    /// 2 = env-var synced, 3 = GLX_SGI_swap_control, 4 = DRM vblank).
+    /// Selected vblank method — always 4 (DRM/KMS vblank anchor), the only
+    /// pacing mechanism.
     pub fn vblank_method(&self) -> u8 {
-        self.vblank_method
+        4
     }
 
     /// Debug stats for the swap-packet USB write:
@@ -573,72 +635,8 @@ impl NvstusbContext {
         }
     }
 
-    /// Sets whether the KMS backend's `eglSwapBuffers` still eats an extra
-    /// vblank of throttle, per the real `eglSwapInterval(0)` result
-    /// (`KmsDisplay::vsync_throttled`). Only affects method 4. Must be called
-    /// before the first `swap()` for method 4 to fire the correct eye.
-    pub fn set_kms_vsync_throttled(&mut self, throttled: bool) {
-        self.kms_vsync_throttled = throttled;
-    }
-
-    /// Method 4: whether the eye is currently being inverted (the page flip
-    /// lands one vblank late, so the shutter must track the previous eye).
-    pub fn kms_eye_inverted(&self) -> bool {
-        self.kms_vsync_throttled
-    }
-
-    /// Method 4: re-derives the eye-inversion decision from the measured
-    /// present error (predicted vblank - actual flip vblank) instead of the
-    /// `eglSwapInterval(0)` readback, which is meaningless on GBM surfaces.
-    ///
-    /// Ground truth: `~0us` means the flip lands on the predicted vblank (no
-    /// throttle) -> the eye must NOT be inverted; `~-one period` means the
-    /// flip lands one vblank late (throttle) -> the eye must be inverted.
-    /// The two states are a full frame apart, so a short average is decisive;
-    /// hysteresis around -half period prevents flapping.
-    fn update_kms_inversion(&mut self) {
-        let count = KMS_ERR_COUNT.load(Ordering::Relaxed);
-        if count < 30 {
-            return;
-        }
-        let total = KMS_ERR_TOTAL.load(Ordering::Relaxed);
-        let period = self
-            .drm_vblank
-            .as_ref()
-            .map(|d| d.period_us())
-            .unwrap_or(8333) as i64;
-        let avg = total / count as i64;
-        let want = if avg < -(period * 6) / 10 {
-            true
-        } else if avg > -(period * 4) / 10 {
-            false
-        } else {
-            KMS_ERR_TOTAL.store(0, Ordering::Relaxed);
-            KMS_ERR_COUNT.store(0, Ordering::Relaxed);
-            return;
-        };
-        KMS_ERR_TOTAL.store(0, Ordering::Relaxed);
-        KMS_ERR_COUNT.store(0, Ordering::Relaxed);
-        if want != self.kms_vsync_throttled {
-            self.kms_vsync_throttled = want;
-            eprintln!(
-                "nvstusb: method 4 present err avg {avg}us -> flip lands {} -> eye inversion {}",
-                if want {
-                    "one vblank late"
-                } else {
-                    "on the predicted vblank"
-                },
-                if want {
-                    "KEPT (driver throttles)"
-                } else {
-                    "DISABLED (driver does not throttle)"
-                },
-            );
-        }
-    }
-
-    /// Forces the DRM anchor to re-anchor on the next frame (used after a KMS
-    /// mode-set, which can shift the vblank phase).
+    /// Forces the DRM anchor to re-anchor on the next frame (used after a mode
+    /// change, which can shift the vblank phase).
     pub fn force_resync(&mut self) {
         if let Some(d) = self.drm_vblank.as_mut() {
             d.force_resync();
@@ -731,307 +729,89 @@ impl NvstusbContext {
     /// `swap_func` performs the actual buffer swap (the equivalent of
     /// `glutSwapBuffers` in the original), returning the flip's DRM
     /// hardware vblank timestamp (CLOCK_MONOTONIC us) when the backend can
-    /// supply one (currently only the KMS path; other backends return
-    /// `None`). `gl` is only used by the software vblank method.
-    pub fn swap<F: FnMut() -> Option<u64>>(&mut self, eye: Eye, gl: &gl::Gl, mut swap_func: F) {
-        self.swap_calls += 1;
-        match self.vblank_method {
-            // Software vsync: swap, then read from the front buffer, which can
-            // only complete after the swap has finished.
-            0 => {
-                swap_func();
-                let mut pixels = [255u8, 0, 255, 255];
-                gl.read_buffer(gl::FRONT);
-                gl.read_pixels(
-                    1,
-                    1,
-                    1,
-                    1,
-                    gl::RGB,
-                    gl::UNSIGNED_BYTE,
-                    pixels.as_mut_ptr() as *mut c_void,
-                );
-                self.set_eye(eye);
+    /// supply one; the windowed backend returns `None`.
+    pub fn swap<F: FnMut() -> Option<u64>>(&mut self, eye: Eye, _gl: &gl::Gl, mut swap_func: F) {
+        // DRM/KMS vblank anchor: busy-wait until `next present vblank -
+        // 3000 - lead`, send the eye packet, then swap blocks to that same
+        // vblank.  The IR fires (packet + 3000us) exactly at the boundary.
+        // swap_phase_us is the host lead before the boundary (~USB write
+        // time); tune with ,/./[ ].
+        //
+        // The page flip actually lands ONE PERIOD after the predicted
+        // vblank: the driver's eglSwapBuffers vblank-throttles to the
+        // predicted vblank (swap interval 0 is rejected), so our
+        // DRM_IOCTL_MODE_PAGE_FLIP takes effect at the following vblank.
+        // The IR therefore fires during the *previous* (opposite) eye's
+        // frame, so the packet must carry that eye: opening its shutter at
+        // the start of its own frame (the frame currently on screen).
+        let period_us = self
+            .drm_vblank
+            .as_ref()
+            .map(|d| d.period_us())
+            .unwrap_or(8333);
+        let pred = self.drm_vblank.as_ref().map(|d| d.current_present_us());
+        let deadline = self
+            .drm_vblank
+            .as_mut()
+            .and_then(|d| d.frame_start(self.swap_phase_us));
+        if let Some(dl) = deadline {
+            spin_until(dl);
+        }
+        // Fire the eye the caller asked for.  The windowed path's swap (via
+        // glutin `swap_buffers`) presents on the predicted vblank, so no
+        // whole-frame eye inversion is needed here (unlike the removed KMS
+        // manual page-flip backend, whose flip landed one vblank late).
+        self.set_eye(eye);
+        let flip_mono_us = swap_func();
+        // Prefer the flip event's own hardware timestamp over a
+        // post-syscall Instant::now() sample - see `frame_end` for why
+        // this removes scheduler/wakeup jitter that was otherwise baked
+        // into the phase the emitter is synced to.
+        //
+        // When the backend supplies no flip clock (the windowed backend
+        // returns `None` from `swap_func`), fall back to the anchor's OWN
+        // vblank clock - the host-epoch timestamp of the last real vblank
+        // on the anchored output (`query_vblank`, the non-master-safe
+        // equivalent of a DRM_MODE_PAGE_FLIP_EVENT - page-flip events need
+        // DRM master, which a windowed client does not hold).  A real
+        // vblank timestamp - not the jittery post-swap `Instant::now()` -
+        // is what lets `frame_end`'s per-frame phase lock converge instead
+        // of chasing sample noise and drifting off the grid.
+        let precise_us = if let (Some(m), Some(d)) =
+            (flip_mono_us, self.drm_vblank.as_ref())
+        {
+            Some(d.host_us_from_mono(m))
+        } else {
+            self.drm_vblank.as_mut().and_then(|d| d.query_vblank())
+        };
+        if let (Some(d), Some(p)) = (self.drm_vblank.as_ref(), pred) {
+            let t = precise_us.unwrap_or_else(|| d.host_epoch_us());
+            let err = p as i64 - t as i64;
+            // Only accumulate sane frames.  Startup (mode-set, initial
+            // anchor convergence) can be off by tens of periods and, if
+            // accumulated, permanently poisons the DRM_PRESENT_* and
+            // resync averages/maxima.  Ignore anything beyond two
+            // periods so the stats reflect steady-state behavior.
+            if err.abs() < (period_us as i64) * 2 {
+                DRM_PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                DRM_PRESENT_TOTAL.fetch_add(err, Ordering::Relaxed);
+                let abs = err.abs();
+                let mut prev = DRM_PRESENT_MAX_ABS.load(Ordering::Relaxed);
+                while abs > prev {
+                    match DRM_PRESENT_MAX_ABS.compare_exchange_weak(
+                        prev,
+                        abs,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(cur) => prev = cur,
+                    }
+                }
             }
-            // GLX_SGI_video_sync + OML present feedback, NVIDIA-contract
-            // pacing: send the eye packet `swap_phase_us` before the
-            // boundary where this frame will ACTUALLY appear, then call the
-            // blocking swap.  On a composited desktop raw vblank ticks are
-            // not enough: the compositor can repeat or delay a buffer, and
-            // one such hiccup leaves glasses and content permanently
-            // opposite (alternating correct/inverted = "terrible sync").
-            // So after each swap we confirm the present via the OML SBC
-            // (swap-block counter) and pace the next packet against the
-            // confirmed present instant.  If rendering finishes too late
-            // for the predicted present, the packet AND the present slip
-            // one period together - pairing survives skips.
-            1 => {
-                // Attribute the previous frame's present first (bounded).
-                self.confirm_last_present();
-
-                let period = Duration::from_micros(self.vsync_period_us);
-
-                // Swap-gap anomaly: if the previous swap returned more than
-                // ~1.25 periods after its predecessor, content held an extra
-                // boundary somewhere (render stall or compositor hiccup).
-                // Whether the glasses must hold too depends on which side
-                // slipped - decided below once this packet's boundary is
-                // known.
-                let mut missed_cycle = false;
-                if let (Some(prev), Some(last)) =
-                    (self.prev_swap_return, self.last_swap_return)
-                {
-                    let dt = last.duration_since(prev);
-                    if dt > period + period / 4 && dt < period * 8 {
-                        missed_cycle = true;
-                    }
-                }
-                self.prev_swap_return = self.last_swap_return;
-
-                // Anchor: with the kernel vblank clock armed (native
-                // Wayland), fire at a fixed phase of the *display's* own
-                // timeline instead of the compositor's callback clock.
-                // Callback-clock jitter used to smear the flip position
-                // across the scanout (seen as a red->blue gradient on the
-                // alternating-color scene).
-                //
-                // Placement model: the packet arrives ~lead us before the
-                // boundary, the firmware fires IR 3000 us later, so the
-                // shutter flips at ~b_next - lead + 3000 + usb.  The kernel
-                // timestamp is the START of blanking (~230 us at
-                // 1440p120), so the default 3100 lands the flip just
-                // inside the blanking interval - tune with `,`/`.`.
-                // Armed lazily, only when no better ground truth exists:
-                // X11 keeps OML SBC attribution, EGL-sync-values systems
-                // keep that clock.  WAIT_VBLANK needs no DRM master, so it
-                // works in windowed mode alongside the compositor and also
-                // seeds the true measured period (8336 us at 119.953 Hz,
-                // not the nominal 120 Hz value).
-                //
-                // The anchor is opened on the CRTC serving the output the
-                // window is on (`target_connector`): on multi-head GPUs the
-                // heads' vblank grids are phase-offset arbitrarily, and
-                // packets paced off the wrong head land mid-scanout.
-                if !self.drm_tried
-                    && self.x11_display == 0
-                    && self.egl_clock.is_none()
-                    && (self.pipe_cycle != 0
-                        || self.target_connector.is_some()
-                        // Blind first-active-head fallback: only after the
-                        // wl_output has had a few seconds to be reported. The
-                        // gate on target_connector is what keeps the anchor
-                        // from arming on an arbitrary head at startup and
-                        // then re-targeting (a packet-phase jump mid-launch,
-                        // seen as the left/right eyes switching a couple of
-                        // times). With the demo polling the output every
-                        // frame until it is known, the anchor engages on the
-                        // correct head within the first couple of frames.
-                        || self.swap_calls >= ARM_GRACE_SWAPS)
-                {
-                    self.drm_tried = true;
-                    // pipe_cycle == 0 -> auto (bind by window output, else
-                    // first active head); 1..=8 -> explicit CRTC pipe index.
-                    let force_pipe = if self.pipe_cycle == 0 {
-                        None
-                    } else {
-                        Some(self.pipe_cycle - 1)
-                    };
-                    self.drm_clock = DrmVblank::open_preferring(
-                        if force_pipe.is_none() {
-                            self.target_connector.as_deref()
-                        } else {
-                            None
-                        },
-                        force_pipe,
-                    );
-                    if let Some(d) = &self.drm_clock {
-                        self.vsync_period_us = d.period_us();
-                    }
-                }
-                let now = Instant::now();
-                let mut drm_target = None;
-                let lead = Duration::from_micros((self.swap_phase_us as u64).min(7000));
-                if let Some(drm) = self.drm_clock.as_mut() {
-                    match drm.query_vblank() {
-                        Some(b_prev) => {
-                            let b_next = b_prev + drm.period_us();
-                            drm_target = Some(drm.instant_of(b_next) - lead);
-                        }
-                        None => {} // transient ioctl failure: legacy anchor
-                    }
-                }
-                let mut target = match drm_target {
-                    Some(t) => t,
-                    None => match self.present_instant {
-                        Some(t) => t + period,
-                        None => {
-                            // No confirmed present yet: seed from a video-sync tick.
-                            self.wait_vblank_boundary() + period
-                        }
-                    },
-                };
-                // Late render: skip to the next boundary with the packet.
-                while target.checked_duration_since(now).map_or(true, |d| d <= lead)
-                {
-                    target += period;
-                }
-
-                // Classify a missed cycle by where THIS packet ended up:
-                //
-                // Render stall - rendering blew past one or more boundaries,
-                // so the skip loop above pushed this packet to a later
-                // boundary, exactly where the throttled present lands too.
-                // Packet and content slip together; pairing survives on its
-                // own and suppressing an extra packet would BREAK it (the
-                // glasses hold while the content advances - one inverted
-                // cycle, visible as a transient split/gradient).
-                //
-                // Compositor hiccup - the app submitted on time so the packet
-                // is still on its regular next boundary, but the buffer flip
-                // missed the deadline and content repeated for a cycle.  Now
-                // the glasses must hold via suppression to stay paired.
-                let boundary = target + lead;
-                let slipped_together = match self.last_packet_boundary {
-                    Some(prev_b) => {
-                        let d = boundary.saturating_duration_since(prev_b);
-                        d > period + period / 4 && d < period * 16
-                    }
-                    None => false,
-                };
-                self.last_packet_boundary = Some(boundary);
-                if missed_cycle && !slipped_together {
-                    self.suppress_next_packet = true;
-                }
-
-                if let Some(wait) =
-                    target.checked_sub(lead).and_then(|t| t.checked_duration_since(now))
-                {
-                    precise_sleep(wait.as_micros() as u64);
-                }
-                if self.suppress_next_packet {
-                    // Glasses hold this boundary in lockstep with content.
-                    self.suppress_next_packet = false;
-                } else {
-                    self.pre_swap_sbc =
-                        self.read_present_counter().unwrap_or(self.pre_swap_sbc);
-                    self.set_eye(eye);
-                    if self.x11_display != 0 || self.egl_clock.is_some() {
-                        self.pending_confirm = true;
-                    }
-                }
-                swap_func();
-                self.last_swap_return = Some(Instant::now());
-            }
-            // __GL_SYNC_TO_VBLANK is defined: the driver does the syncing.
-            2 => {
-                swap_func();
-                self.set_eye(eye);
-            }
-            // DRM/KMS vblank anchor: busy-wait until `next present vblank -
-            // 3000 - lead`, send the eye packet, then swap blocks to that same
-            // vblank.  The IR fires (packet + 3000us) exactly at the boundary.
-            // swap_phase_us is the host lead before the boundary (~USB write
-            // time); tune with ,/./[ ].
-            //
-            // The page flip actually lands ONE PERIOD after the predicted
-            // vblank: the driver's eglSwapBuffers vblank-throttles to the
-            // predicted vblank (swap interval 0 is rejected), so our
-            // DRM_IOCTL_MODE_PAGE_FLIP takes effect at the following vblank.
-            // The IR therefore fires during the *previous* (opposite) eye's
-            // frame, so the packet must carry that eye: opening its shutter at
-            // the start of its own frame (the frame currently on screen).
-            4 => {
-                let period_us = self
-                    .drm_vblank
-                    .as_ref()
-                    .map(|d| d.period_us())
-                    .unwrap_or(8333);
-                let pred = self.drm_vblank.as_ref().map(|d| d.current_present_us());
-                let deadline = self
-                    .drm_vblank
-                    .as_mut()
-                    .and_then(|d| d.frame_start(self.swap_phase_us));
-                if let Some(dl) = deadline {
-                    spin_until(dl);
-                }
-                // Only invert to the opposite (currently-on-screen) eye when
-                // the page flip actually lands one vblank after the predicted
-                // present (driver throttles inside eglSwapBuffers). If the
-                // flip lands on the predicted vblank there's no extra latency
-                // and `eye` (the one we just rendered / are about to flip to)
-                // is the one whose content is on screen when the shutter
-                // opens - inverting here in that case fires the wrong shutter
-                // every single frame.
-                let fire_eye = if self.kms_vsync_throttled {
-                    match eye {
-                        Eye::Left => Eye::Right,
-                        Eye::Right => Eye::Left,
-                        Eye::Quad => Eye::Quad,
-                    }
-                } else {
-                    eye
-                };
-                self.set_eye(fire_eye);
-                let flip_mono_us = swap_func();
-                // Prefer the flip event's own hardware timestamp over a
-                // post-syscall Instant::now() sample - see `frame_end` and
-                // `KmsDisplay::present` for why this removes scheduler/wakeup
-                // jitter that was otherwise baked into the phase the emitter
-                // is synced to.
-                let precise_us = flip_mono_us
-                    .and_then(|m| self.drm_vblank.as_ref().map(|d| d.host_us_from_mono(m)));
-                if let (Some(d), Some(p)) = (self.drm_vblank.as_ref(), pred) {
-                    let t = precise_us.unwrap_or_else(|| d.host_epoch_us());
-                    let err = p as i64 - t as i64;
-                    // Only accumulate sane frames.  Startup (mode-set, initial
-                    // anchor convergence) can be off by tens of periods and, if
-                    // accumulated, permanently poisons the DRM_PRESENT_* and
-                    // resync averages/maxima.  Ignore anything beyond two
-                    // periods so the stats reflect steady-state behavior.
-                    if err.abs() < (period_us as i64) * 2 {
-                        DRM_PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
-                        DRM_PRESENT_TOTAL.fetch_add(err, Ordering::Relaxed);
-                        let abs = err.abs();
-                        let mut prev = DRM_PRESENT_MAX_ABS.load(Ordering::Relaxed);
-                        while abs > prev {
-                            match DRM_PRESENT_MAX_ABS.compare_exchange_weak(
-                                prev,
-                                abs,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(cur) => prev = cur,
-                            }
-                        }
-                        // Feed the long-running average used for the inversion
-                        // decision (same two-period gate).
-                        KMS_ERR_TOTAL.fetch_add(err, Ordering::Relaxed);
-                        KMS_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                if let Some(d) = self.drm_vblank.as_mut() {
-                    d.frame_end(precise_us);
-                }
-                self.update_kms_inversion();
-            }
-            // GLX_SGI_swap_control: set the swap interval based on the eye.
-            3 => {
-                let interval = if eye == Eye::Quad { 2 } else { 1 };
-                if self.current_swap_interval != interval {
-                    let swap_interval = self
-                        .glx
-                        .swap_interval_sgi
-                        .expect("missing glXSwapIntervalSGI");
-                    unsafe {
-                        swap_interval(interval);
-                    }
-                    self.current_swap_interval = interval;
-                }
-                swap_func();
-                self.set_eye(eye);
-            }
-            other => eprintln!("nvstusb: unknown vblank method {}", other),
+        }
+        if let Some(d) = self.drm_vblank.as_mut() {
+            d.frame_end(precise_us);
         }
     }
 
@@ -1060,258 +840,97 @@ impl NvstusbContext {
             toggled_3d,
         }
     }
-
-    /// Blocks until the next vblank boundary passes (SGI video sync in the
-    /// app's own GLX context).  Returns the boundary instant; also refreshes
-    /// the smoothed period estimate.  Used only to seed pacing before the
-    /// first confirmed present.
-    fn wait_vblank_boundary(&mut self) -> Instant {
-        let (get, wait) = match (
-            self.glx.get_video_sync_sgi,
-            self.glx.wait_video_sync_sgi,
-        ) {
-            (Some(g), Some(w)) => (g, w),
-            _ => return Instant::now(),
-        };
-
-        let mut count: u32 = 0;
-        unsafe { get(&mut count) };
-        // One-counter-tick wait via the parity idiom: block until the
-        // counter's parity flips to the opposite of the value just read.
-        let rem = (count.wrapping_add(1)) & 1;
-        unsafe { wait(2, rem as i32, &mut count) };
-        let now = Instant::now();
-
-        if let Some(last) = self.present_instant {
-            let dt = now.duration_since(last).as_micros() as u64;
-            if (7600..=9000).contains(&dt) {
-                self.vsync_period_us = (self.vsync_period_us * 3 + dt) / 4;
-            }
-        }
-        now
-    }
-
-    /// Reads the OML swap-block counter for the app's drawable, if armed.
-    fn read_sbc(&self) -> Option<i64> {
-        let get = self.glx.get_sync_values_oml?;
-        let (mut ust, mut msc, mut sbc) = (0i64, 0i64, 0i64);
-        // GLX returns False without a current GLX context (e.g. native
-        // Wayland, where these symbols resolve but are meaningless) - the
-        // counters stay untouched, so treat that as "no data".
-        let ok = unsafe {
-            get(self.x11_display as *mut _, self.x11_drawable, &mut ust, &mut msc, &mut sbc)
-        };
-        if ok == 0 {
-            return None;
-        }
-        Some(sbc)
-    }
-
-    /// Present-counter snapshot for method 1: the OML SBC on X11/GLX (only
-    /// moves when OUR buffer completes), or the hardware vblank MSC via the
-    /// shadow EGL surface on native Wayland (moves every boundary; used to
-    /// time packets against real vblanks since SGI video sync no-ops there).
-    fn read_present_counter(&self) -> Option<i64> {
-        if let Some(egl) = self.egl_clock.as_ref() {
-            let (mut ust, mut msc, mut sbc) = (0i64, 0i64, 0i64);
-            unsafe {
-                if (egl.get_sync_values)(egl.dpy, egl.surf, &mut ust, &mut msc, &mut sbc)
-                    == 0
-                {
-                    return None;
-                }
-            }
-            return Some(msc);
-        }
-        self.read_sbc()
-    }
-
-    /// Waits (bounded to ~2 periods) until the present counter shows the
-    /// previous frame's swap completed, then records that instant as the
-    /// pacing anchor.  On X11 this is exact buffer attribution via SBC; on
-    /// Wayland it is the first vblank boundary after the swap call, which
-    /// tracks the compositor's cadence closely enough to phase-lock against
-    /// instead of the noisy swap-return instant.
-    fn confirm_last_present(&mut self) {
-        if !self.pending_confirm {
-            return;
-        }
-        self.pending_confirm = false;
-
-        let deadline = Instant::now() + Duration::from_micros(2 * self.vsync_period_us);
-        loop {
-            match self.read_present_counter() {
-                Some(sbc) if sbc > self.pre_swap_sbc => {
-                    let now = Instant::now();
-                    if let Some(last) = self.present_instant {
-                        let dt = now.duration_since(last).as_micros() as u64;
-                        if (7600..=9000).contains(&dt) {
-                            self.vsync_period_us = (self.vsync_period_us * 3 + dt) / 4;
-                        }
-                    }
-                    self.present_instant = Some(now);
-                    return;
-                }
-                None => return, // OML unavailable: legacy pacing.
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                // Present not observed in time (heavy compositor backlog).
-                // Keep the old anchor; prediction re-syncs on the next hit.
-                eprintln!("nvstusb: present confirmation timed out");
-                return;
-            }
-            precise_sleep(300);
-        }
-    }
-
-    /// Starts the stereo thread for `GL_STEREO` (quad-buffered) setups. The
-    /// original demo doesn't use this; it drives the emitter from the idle loop
-    /// instead.
-    pub fn start_stereo_thread(&mut self) {
-        if self.thread_running.load(Ordering::SeqCst) {
-            return;
-        }
-        self.thread_running.store(true, Ordering::SeqCst);
-        let running = self.thread_running.clone();
-        let ctx_ptr = self as *mut NvstusbContext;
-
-        // The context is only accessed from this thread while it exists (it is
-        // stopped before the context is dropped), mirroring the unsynchronized
-        // sharing in the original C.
-        struct SendPtr(*mut NvstusbContext);
-        unsafe impl Send for SendPtr {}
-        impl SendPtr {
-            fn get(&self) -> *mut NvstusbContext {
-                self.0
-            }
-        }
-        let ctx_ptr = SendPtr(ctx_ptr);
-
-        self.thread = Some(thread::spawn(move || {
-            let ctx = unsafe { &mut *ctx_ptr.get() };
-            let hidden = match x11glx::HiddenGlx::create() {
-                Some(hidden) => hidden,
-                None => {
-                    eprintln!("nvstusb: unable to create hidden GLX context for stereo thread");
-                    running.store(false, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            while running.load(Ordering::SeqCst) {
-                ctx.swap(Eye::Quad, &hidden.gl, || None);
-                let keys = ctx.get_keys();
-                if keys.toggled_3d {
-                    ctx.invert_eyes();
-                }
-            }
-        }));
-    }
-
-    /// Stops the stereo thread and waits for it to finish.
-    pub fn stop_stereo_thread(&mut self) {
-        if !self.thread_running.load(Ordering::SeqCst) {
-            return;
-        }
-        self.thread_running.store(false, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
-impl Drop for NvstusbContext {
-    fn drop(&mut self) {
-        self.stop_stereo_thread();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the multi-head re-target logic.  The demo must
+    /// re-arm the DRM vblank anchor onto the output the window is on; an
+    /// anchor left on another head of a multi-head GPU free-runs at the same
+    /// refresh but arbitrary phase, so the shutter flips mid-scanout and the
+    /// frame lock never converges.  This pins the decision that was broken
+    /// when the re-target call was dropped from the window-move path.
+    #[test]
+    fn anchor_retarget_follows_the_window_output() {
+        // Window on DP-2 while the anchor binds blind (first active head):
+        // HEAD regression - the anchor stayed on the wrong head ("not
+        // anchored at all").  Must re-arm.
+        assert!(needs_anchor_retarget(None, Some("DP-2")));
+        // Window on DP-2, anchor still on the other head DP-1: must re-arm.
+        assert!(needs_anchor_retarget(Some("dp-1"), Some("DP-2")));
+        // Window on DP-2, anchor (however it binds) on DP-2: nothing to do.
+        assert!(!needs_anchor_retarget(Some("DP-2"), Some("DP-2")));
+        // Window's output not yet reported (boot): leave the anchor alone.
+        assert!(!needs_anchor_retarget(Some("DP-1"), None));
+        assert!(!needs_anchor_retarget(None, None));
+        // Connector-name spelling variants must still count as "the same head"
+        // (normalize is applied before this is called, but pin the exact
+        // equality so silent case/alias regressions are caught).
+        assert_eq!(normalize_connector_name("DP-2"), normalize_connector_name("dp-2"));
+        assert_eq!(normalize_connector_name("DisplayPort-1"), "dp-1");
+        assert_eq!(normalize_connector_name("HDMI-1"), "hdmi-a-1");
     }
-}
 
-// ---------------------------------------------------------------------------
-// Wayland/EGL present clock (runtime-loaded, no build-time EGL dependency)
-// ---------------------------------------------------------------------------
-
-/// EGL config attribute constants used below.
-const EGL_SURFACE_TYPE: i32 = 0x3033;
-const EGL_WINDOW_BIT: i32 = 0x0004;
-const EGL_RED_SIZE: i32 = 0x3024;
-const EGL_GREEN_SIZE: i32 = 0x3023;
-const EGL_BLUE_SIZE: i32 = 0x3022;
-const EGL_NONE: i32 = 0x3038;
-
-/// Builds an [`EglClock`] over the app's Wayland display + surface.
-///
-/// `eglGetDisplay` is specified to return the same `EGLDisplay` singleton for
-/// the same native display, so this joins the app's own EGL instance rather
-/// than creating a parallel one.  The shadow surface is created only so the
-/// sync-value query has a target; it never receives buffers.
-///
-/// # Safety
-/// `wl_display`/`wl_surface` must be valid for the lifetime of the returned
-/// clock (they are the app's own objects, which outlive it).
-unsafe fn egl_clock_new(wl_display: usize, wl_surface: usize) -> Result<EglClock, String> {
-    use libloading::{Library, Symbol};
-
-    let lib = Library::new("libEGL.so.1")
-        .or_else(|_| Library::new("libEGL.so"))
-        .map_err(|e| format!("dlopen libEGL: {e}"))?;
-    // Leaked on purpose: the entry points must outlive the context.
-    let lib: &'static Library = Box::leak(Box::new(lib));
-
-    unsafe {
-        let get_display: Symbol<unsafe extern "C" fn(usize) -> usize> =
-            lib.get(b"eglGetDisplay").map_err(|e| e.to_string())?;
-        let initialize: Symbol<unsafe extern "C" fn(usize, *mut i32, *mut i32) -> u32> =
-            lib.get(b"eglInitialize").map_err(|e| e.to_string())?;
-        let choose_config: Symbol<
-            unsafe extern "C" fn(usize, *const i32, *mut usize, i32, *mut i32) -> u32,
-        > = lib.get(b"eglChooseConfig").map_err(|e| e.to_string())?;
-        let create_window_surface: Symbol<
-            unsafe extern "C" fn(usize, usize, usize, *const i32) -> usize,
-        > = lib.get(b"eglCreateWindowSurface").map_err(|e| e.to_string())?;
-        let get_sync_values: Symbol<
-            unsafe extern "C" fn(usize, usize, *mut i64, *mut i64, *mut i64) -> u32,
-        > = lib
-            .get(b"eglGetSyncValuesCHROMIUM")
-            .map_err(|_| "eglGetSyncValuesCHROMIUM not exposed by this driver".to_string())?;
-
-        let dpy = get_display(wl_display);
-        if dpy == 0 {
-            return Err("eglGetDisplay failed".into());
+    /// Pins that the anchor re-target decision is rejection-consistent: the
+    /// moment the anchor lands on the correct head it stops re-arming, and any
+    /// second head at all forces a re-arm (never a silently-wrong bind).
+    #[test]
+    fn anchor_retarget_matches_exactly_one_head() {
+        let heads = ["DP-1", "DP-2", "HDMI-A-1"];
+        for window in heads {
+            for anchor in heads {
+                let same = normalize_connector_name(window) == normalize_connector_name(anchor);
+                assert_eq!(
+                    needs_anchor_retarget(Some(anchor), Some(window)),
+                    !same,
+                    "anchor={anchor} window={window}"
+                );
+            }
         }
-        let (mut major, mut minor) = (0i32, 0i32);
-        if initialize(dpy, &mut major, &mut minor) == 0 {
-            return Err("eglInitialize failed".into());
-        }
+    }
 
-        let attribs = [
-            EGL_SURFACE_TYPE,
-            EGL_WINDOW_BIT,
-            EGL_RED_SIZE,
-            8,
-            EGL_GREEN_SIZE,
-            8,
-            EGL_BLUE_SIZE,
-            8,
-            EGL_NONE,
-        ];
-        let mut config = 0usize;
-        let mut num_config = 0i32;
-        if choose_config(dpy, attribs.as_ptr(), &mut config, 1, &mut num_config) == 0
-            || num_config < 1
-        {
-            return Err("eglChooseConfig found no window config".into());
-        }
+    #[test]
+    fn ini_selects_profile_by_refresh_rate() {
+        let dir = std::env::temp_dir().join("nvstusb_timings_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("MonitorTimings.ini");
+        std::fs::write(
+            &path,
+            "[0]\n\
+             Monitor: Samsung LC27G5xT 1440p 120Hz\n\
+             EDID_ID: SAM28794\n\
+             RefreshRateHz: 119.998\n\
+             X_us: 0.50\n\
+             Y_us: 7334.00\n\
+             Z_us: 8333.50\n\
+             W_us: 4735.58\n\
+             [1]\n\
+             Monitor: AsusPG248Q 100Hz original\n\
+             EDID_ID: AUS24B1\n\
+             RefreshRateHz: 99.931\n\
+             X_us: 203.25\n\
+             Y_us: 8800.00\n\
+             Z_us: 10006.92\n\
+             W_us: 5204.33\n",
+        )
+        .unwrap();
 
-        let surf = create_window_surface(dpy, config, wl_surface, std::ptr::null());
-        if surf == 0 {
-            return Err("eglCreateWindowSurface failed".into());
-        }
+        let s = path.to_str().unwrap();
+        // 120 Hz monitor picks the Samsung profile...
+        let t = ShutterTimings::from_ini_file(s, 120.0, 0.5).unwrap();
+        assert_eq!(t.x_us, 0.5);
+        assert_eq!(t.y_us, 7334.0);
+        assert_eq!(t.z_us, 8333.5);
+        assert_eq!(t.w_us, 4735.58);
+        // ...100 Hz picks the Asus entry...
+        let t = ShutterTimings::from_ini_file(s, 100.0, 0.5).unwrap();
+        assert_eq!(t.x_us, 203.25);
+        assert_eq!(t.y_us, 8800.0);
+        // ...and an unlisted rate matches nothing.
+        assert!(ShutterTimings::from_ini_file(s, 144.0, 0.5).is_none());
 
-        Ok(EglClock {
-            dpy,
-            surf,
-            get_sync_values: *get_sync_values,
-        })
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
