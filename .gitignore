@@ -3,3 +3,10 @@
 
 # cargo
 /target
+
+# makepkg -git artifacts (if you run makepkg inside the checkout)
+/nvstereo3d-git/
+/src/nvstereo3d-git/
+/src/target/
+/pkg/
+/*.pkg.tar.*

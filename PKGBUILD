@@ -7,7 +7,7 @@
 # the binaries.
 
 pkgname=nvstereo3d-git
-pkgver=0.1.0.r5
+pkgver=0.1.0.r6
 pkgrel=1
 pkgdesc="NVIDIA 3D Vision IR emitter on Linux: nvstereo3d host bridge for wiz3D under Wine + nvstereo-calibrate tuning demo"
 arch=('x86_64')
