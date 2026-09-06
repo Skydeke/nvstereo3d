@@ -4,7 +4,11 @@
 # cargo
 /target
 
-# makepkg -git artifacts (if you run makepkg inside the checkout)
+# makepkg artifacts (the PKGBUILD lives in build/ and runs from there)
+/build/*
+!/build/PKGBUILD
+
+# stale artifacts from running `makepkg` at the checkout root
 /nvstereo3d-git/
 /src/nvstereo3d-git/
 /src/target/

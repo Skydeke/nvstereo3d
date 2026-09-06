@@ -22,16 +22,17 @@ Requires an **AMD** GPU: the emitter is synced to the kernel vblank clock
 
 ## Install
 
-Arch: build the `-git` PKGBUILD shipped in this repo (builds HEAD of the
-repo), which installs both binaries plus the udev rule:
+Arch: build the `-git` PKGBUILD in the repo's `build/` folder:
 
     git clone https://github.com/Skydeke/nvstereo3d
-    cd nvstereo3d
-    makepkg -si
+    cd nvstereo3d/build
+    makepkg -sic
 
-The PKGBUILD pulls the source over SSH, so your GitHub SSH key must be set
-up. Re-plug the emitter after installing. Without the udev rule only root can
-open it — run the binaries under `sudo` until then.
+Running it from `build/` keeps every generated file inside that folder, out
+of the checkout. The PKGBUILD clones the latest **pushed** HEAD over SSH
+(your GitHub SSH key must be set up; push changes before rebuilding) and
+installs both binaries plus the udev rule — re-plug the emitter after
+installing.
 
 Any distro: `cargo build --release`.
 
