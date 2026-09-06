@@ -52,7 +52,7 @@ pub const OFF_FLAGS: usize = 36;
 
 /// Window-owner -> helper target display.  A fixed 12-byte, null-terminated
 /// ASCII field in the header's spare bytes (52..=63) naming the DRM connector
-/// (e.g. `DP-2`) the game window is actually on.  The window owner (the 3dv3d
+/// (e.g. `DP-2`) the game window is actually on.  The window owner (the nvstereo-calibrate
 /// demo, via winit's `current_monitor().name()`, or the wiz3D DLL via the
 /// target monitor's EDID) writes it whenever the window changes heads; the
 /// helper re-anchors its vblank clock to that connector.  Empty = no signal.

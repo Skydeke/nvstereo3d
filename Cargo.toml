@@ -2,37 +2,37 @@
 name = "nvstereo3d"
 version = "0.1.0"
 edition = "2021"
-description = "NVIDIA 3D Vision OpenGL demo (3dv3d) + Linux host helper (nvstereo3d-host) for the USB IR emitter"
+description = "NVIDIA 3D Vision IR emitter on Linux: nvstereo3d host bridge for wiz3D under Wine + nvstereo-calibrate tuning demo"
 license = "MIT OR Apache-2.0"
 rust-version = "1.70"
 
-# `cargo run` builds the default binary = the 3dv3d demo.
-default-run = "3dv3d"
+# `cargo run` builds the default binary = the nvstereo-calibrate tuning demo.
+default-run = "nvstereo-calibrate"
 
 [lib]
 name = "nvstereo3d"
 path = "src/lib.rs"
 
 [[bin]]
-name = "3dv3d"
-path = "src/bin/3dv3d.rs"
+name = "nvstereo-calibrate"
+path = "src/bin/nvstereo-calibrate.rs"
 
 [[bin]]
-name = "nvstereo3d-host"
-path = "src/bin/nvstereo3d-host.rs"
+name = "nvstereo3d"
+path = "src/bin/nvstereo3d.rs"
 
-# Shared: 3dv3d demo + host both drive the same NVIDIA 3D Vision USB emitter.
+# Shared: calibration demo + host both drive the same NVIDIA 3D Vision USB emitter.
 [dependencies]
 rusb = "0.9"
 
-# --- 3dv3d (OpenGL GLUT-style demo) ---------------------------------------
+# --- nvstereo-calibrate (OpenGL stereo tuning demo) -----------------------
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
 winit = "0.30.13"
 libloading = "0.8"
 raw-window-handle = "0.6"
 
-# --- nvstereo3d-host (shared-memory ring + DRM vblank anchor) -------------
+# --- nvstereo3d (shared-memory ring + DRM vblank anchor) ------------------
 memmap2 = "0.9"
 libc = "0.2"
 
@@ -40,7 +40,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# --- libraries for the 3dv3d GL + direct-KMS render path -------------------
+# --- libraries for the nvstereo-calibrate GL + direct-KMS render path -----
 glow = "0.18"
 glam = "0.30"
 bytemuck = "1.25"

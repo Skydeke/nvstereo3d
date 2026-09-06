@@ -2,7 +2,7 @@
 //! USB IR emitter.
 //!
 //! One source serves both consumers in this crate:
-//!   - `nvstusb::NvstusbContext` (the 3dv3d demo) uses the transport
+//!   - `nvstusb::NvstusbContext` (the nvstereo-calibrate demo) uses the transport
 //!     (`usb_init` / `open_device` / `write_bulk` / `read_bulk`) and the
 //!     configure/send helpers below.
 //!   - the `host` helper (wiz3D bridge) uses the same transport plus
@@ -499,7 +499,7 @@ pub fn timings_block(rate: f32, x_us: f64, y_us: f64, w_us: f64) -> [u8; 28] {
 
 impl UsbDevice {
     /// Configures the emitter for the given refresh rate and enables driver
-    /// mode.  Exact byte stream from 3dv3d's `NvstusbContext::set_rate`, with
+    /// mode.  Exact byte stream from nvstereo-calibrate's `NvstusbContext::set_rate`, with
     /// the reference 1440p @ 120 Hz shutter timings (X=0.5us, Y=7334.0us,
     /// W=4735.58us) and Z taken from the refresh rate.  `configure` owns the
     /// 0x1c / timeout / driver-enable registers; use [`Self::set_timings_us`]
@@ -588,7 +588,7 @@ impl UsbDevice {
         let _ = self.write_bulk(2, &cmd);
     }
 
-    /// Fires one shutter pulse for the given eye.  Same packet as 3dv3d's
+    /// Fires one shutter pulse for the given eye.  Same packet as nvstereo-calibrate's
     /// `NvstusbContext::set_eye` (master-mode shutter packet, endpoint 1).
     /// `rate` is used to derive the T2 timer reload value.
     pub fn send_eye(&self, right: bool, rate: f32) {

@@ -15,8 +15,14 @@
 //! `z` (the glasses frame time) is always 1e6 / refresh, so it is derived at
 //! use time rather than stored.
 //!
-//! This module is shared by both binaries so a profile saved by the 3dv3d
-//! demo (with `s`) is picked up by `nvstereo3d-host`:
+//! Where the DB lives (see [`db_path`]): an explicit `NVSTUSB_TIMINGS_JSON`
+//! path overrides everything; otherwise a `monitor_timings.json` sitting in
+//! the current working directory wins (PWD precedence — e.g. the repo's
+//! checked-in file); otherwise the per-user XDG config dir
+//! `~/.config/nvstereo3d/monitor_timings.json` is used.
+//!
+//! This module is shared by both binaries so a profile saved by the
+//! `nvstereo-calibrate` demo (with `s`) is picked up by `nvstereo3d`:
 //!   - the demo writes the tuned X/Y/W + lead + measured refresh back on `s`;
 //!   - both binaries read it back at startup and apply the matching profile.
 //!
@@ -35,12 +41,48 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Name override env var for the JSON database path.
+/// Name override env var for the JSON database path (debug/testing; not
+/// advertised in the README).
 pub const ENV_PATH: &str = "NVSTUSB_TIMINGS_JSON";
 
-/// Default database path (current working directory), matching the repo's
-/// checked-in `monitor_timings.json`.
+/// Database file name, relative to the current working directory or the
+/// per-user config dir.
 pub const DEFAULT_PATH: &str = "monitor_timings.json";
+
+/// The per-user config dir for nvstereo3d: `$XDG_CONFIG_HOME/nvstereo3d`,
+/// defaulting to `~/.config/nvstereo3d` when unset.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("nvstereo3d"))
+}
+
+/// Resolves the database path:
+/// 1. an explicit `NVSTUSB_TIMINGS_JSON` path (debug/testing override);
+/// 2. `./monitor_timings.json` — the file next to where the process was
+///    started.  PWD takes precedence, so a DB checked into a repo or dropped
+///    next to a game always wins over the per-user copy;
+/// 3. the per-user config dir (`~/.config/nvstereo3d/monitor_timings.json`).
+pub fn db_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(p) = std::env::var_os(ENV_PATH) {
+        return PathBuf::from(p);
+    }
+    let local = PathBuf::from(DEFAULT_PATH);
+    if local.exists() {
+        return local;
+    }
+    config_dir()
+        .map(|d| d.join(DEFAULT_PATH))
+        .unwrap_or(local)
+}
 
 /// Default host-side IR packet lead if a profile carries none (missing field
 /// in an older/legacy file): matched to the demo's `swap_phase_us` default.
@@ -64,7 +106,7 @@ pub struct MonitorEntry {
     /// Shutter register W: 2nd T2 counter (us).
     pub w_us: f64,
     /// Host-side IR packet lead before the vblank boundary (us) — the same
-    /// value the demo's `Phase` knob tunes and `nvstereo3d-host` applies to
+    /// value the demo's `Phase` knob tunes and `nvstereo3d` applies to
     /// `frame_start`.
     pub lead_us: f64,
 }
@@ -95,14 +137,6 @@ impl MonitorEntry {
 
 /// The whole database: monitor key -> entry.
 pub type TimingsDb = BTreeMap<String, MonitorEntry>;
-
-/// Resolves the database path from `NVSTUSB_TIMINGS_JSON`, falling back to
-/// [`DEFAULT_PATH`].
-pub fn db_path() -> std::path::PathBuf {
-    std::env::var_os(ENV_PATH)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_PATH))
-}
 
 /// Loads the database from the path returned by [`db_path`]. Missing /
 /// unparseable files yield an empty map so callers can carry on with defaults.
@@ -180,9 +214,16 @@ pub fn save_entry(key: &str, entry: &MonitorEntry) -> Result<std::path::PathBuf,
 }
 
 /// Serializes the database back to `monitor_timings.json` (pretty-printed,
-/// alphabetically keyed).
+/// alphabetically keyed).  The target dir (e.g. `~/.config/nvstereo3d`) is
+/// created on demand.
 pub fn save(db: &TimingsDb) -> Result<std::path::PathBuf, String> {
     let path = db_path();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+    }
     let text = serde_json::to_string_pretty(db).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(&path, text + "\n").map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
@@ -290,6 +331,19 @@ mod tests {
         let e = db.get("ACI_23F7_120").unwrap();
         assert!((e.lead_us - DEFAULT_LEAD_US).abs() < 1e-9);
         assert!((e.z_us() - 1_000_000.0 / 119.983).abs() < 1.0);
+    }
+
+    /// `config_dir()` follows `$XDG_CONFIG_HOME` when set (the per-user DB
+    /// home) instead of `~/.config`.
+    #[test]
+    fn config_dir_follows_xdg_config_home() {
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/nvstereo3d-xdg-test");
+        let d = config_dir().expect("config dir with XDG_CONFIG_HOME set");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(
+            d,
+            std::path::PathBuf::from("/tmp/nvstereo3d-xdg-test/nvstereo3d")
+        );
     }
 
     /// Parses an actual `monitor_timings.json` written in the project's OWN

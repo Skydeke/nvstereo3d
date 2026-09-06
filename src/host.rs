@@ -2,9 +2,8 @@
 //!
 //! wiz3D's `Nvidia3DOutput.dll` (running under Wine/Proton) pushes one
 //! eye-swap command per presented frame into a shared-memory ring
-//! (`/tmp/nvstusb.shm`, exposed to Wine as `Z:\tmp\nvstusb.shm`) and sends a
-//! non-blocking one-byte UDP datagram to wake us.  This helper owns the USB
-//! emitter and fires the shutter packet in step with the display.
+//! (`/tmp/nvstusb.shm`, exposed to Wine as `Z:\tmp\nvstusb.shm`).  This helper
+//! owns the USB emitter and fires the shutter packet in step with the display.
 //!
 //! ## Why the eye comes straight from the game's ring -- and now WHEN
 //!
@@ -68,7 +67,6 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::nvstusb::drm;
@@ -78,7 +76,7 @@ use crate::shm;
 use crate::shm::{EYE_RIGHT, FLAG_EMITTER_PRESENT, FLAG_FIRMWARE_LOADED,
                 Shm, STATUS_ERROR, STATUS_OPENING, STATUS_READY};
 
-/// Embedded firmware image (must match the one shipped with `3dv3d`).
+/// Embedded firmware image (must match the one shipped with `nvstereo-calibrate`).
 const FIRMWARE: &[u8] = include_bytes!("../firmware/nvstusb.fw");
 
 fn env_or(key: &str, default: &str) -> String {
@@ -162,7 +160,7 @@ const MASTER_LOCK_MAX_SAME_EYE: u64 = 10;
 /// (and, for the RP2040 clone, the separate `set_alarm_delay_us` write) own
 /// the alarm.
 /// Default extra lead folded into the pre-fire busy-wait (see
-/// [`fire_lead_us`]).  Matches the 3dv3d demo's default `swap_phase_us` (3100)
+/// [`fire_lead_us`]).  Matches the nvstereo-calibrate demo's default `swap_phase_us` (3100)
 /// -- the value `NvstusbContext::new` sets and the working `cargo run` demo
 /// feeds to `DrmVblank::frame_start`.  The host must pre-fire the SAME lead so
 /// the shutter window lands in the same place relative to the boundary; the old
@@ -1341,7 +1339,7 @@ fn requested_connector() -> Option<String> {
 
 /// Resolves a value published by the window owner into a concrete kernel
 /// connector name suitable for re-anchoring the DRM vblank clock.  The shared
-/// header can carry either a concrete connector name (e.g. `DP-2`, as the 3dv3d
+/// header can carry either a concrete connector name (e.g. `DP-2`, as the nvstereo-calibrate
 /// demo publishes from winit's `current_monitor()`) or an EDID `VENDOR_PRODUCT`
 /// base (e.g. `SAM_707A`, as the wiz3D DLL publishes from the target monitor's
 /// EDID).  A name that matches an existing connector is used directly; an
@@ -1389,9 +1387,9 @@ fn derive_anchor_for(
 
 /// Applies a per-monitor shutter profile from `monitor_timings.json` to `device` for
 /// `rate_hz`, if the monitor (`connector`, e.g. `DP-1`) has a matching entry.
-/// This is the host-side counterpart of the 3dv3d demo's `s`-key save: a
+/// This is the host-side counterpart of the nvstereo-calibrate demo's `s`-key save: a
 /// profile tuned and saved by the demo is loaded here too, so
-/// `nvstereo3d-host` shuts the glasses with the same X/Y/W registers the demo
+/// `nvstereo3d` shuts the glasses with the same X/Y/W registers the demo
 /// settled on.  It ALSO applies the profile's per-monitor host IR lead and
 /// returns it (in us) so the caller can update its `frame_start` lead
 /// accordingly.  An explicit `NVSTUSB_HOST_LEAD_US` env override takes
@@ -1622,12 +1620,6 @@ impl StreamStats {
 
 pub fn run() {
     let shm_path = env_or("NVSTUSB_SHM_PATH", shm::DEFAULT_SHM_PATH);
-    let port: u16 = env_or("NVSTUSB_HOST_PORT", "8777")
-        .parse()
-        .unwrap_or(8777);
-    // How long the wake socket blocks before re-checking the ring (a lost or
-    // coalesced wake is still picked up within this interval).
-    let poll_timeout_ms: u64 = env_or("NVSTUSB_POLL_MS", "5").parse().unwrap_or(5);
 
     // --- Shared memory -----------------------------------------------------
     let mut shm = match Shm::open(&shm_path) {
@@ -1653,19 +1645,6 @@ pub fn run() {
          untouched).  NVSTUSB_STAMP_DIAG=1 prints per-swap stamp diagnostics."
     );
 
-    // --- Wake socket -------------------------------------------------------
-    let wake_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
-    let sock = match UdpSocket::bind(wake_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("nvstusb-host: cannot bind wake socket {wake_addr}: {e}");
-            std::process::exit(1);
-        }
-    };
-    sock.set_read_timeout(Some(Duration::from_millis(poll_timeout_ms)))
-        .ok();
-    eprintln!("nvstusb-host: wake socket listening on {wake_addr}");
-
     // --- USB emitter -------------------------------------------------------
     let ctx = match usb::usb_init() {
         Some(c) => c,
@@ -1689,7 +1668,7 @@ pub fn run() {
 
     // --- DRM vblank anchor ------------------------------------------------
     // Anchors each eye packet to the display engine's real refresh clock,
-    // exactly the mechanism 3dv3d relies on to shutter under a compositor.
+    // exactly the mechanism nvstereo-calibrate relies on to shutter under a compositor.
     // If unavailable (no /dev/dri vblank), we fall back to firing on the
     // game's presents directly.
     //
@@ -1767,7 +1746,6 @@ pub fn run() {
     // --- Main loop --------------------------------------------------------
     let mut last_rate = rate_hz;
     let mut last_delay = delay_us;
-    let mut buf = [0u8; 64];
 
     // The most recent connector the window owner published into the shared
     // region, so a republish that resolves to the same head does nothing and a
@@ -1902,7 +1880,7 @@ pub fn run() {
 
     // The fire target (host-epoch vblank to arm the IR for) is owned by the
     // DRM anchor itself (`DrmVblank::next_present_us`), advanced by the SAME
-    // `frame_start`/`frame_end` pair the working 3dv3d demo drives the emitter
+    // `frame_start`/`frame_end` pair the working nvstereo-calibrate demo drives the emitter
     // with.  The host must NOT keep a second, independently re-anchored clock
     // here: the hand-rolled copy previously tracked `vblank + period` with a
     // phase-preserving fold that lacked `frame_start`'s grid-snap and
@@ -1916,12 +1894,13 @@ pub fn run() {
     // (advances one period + sub-slot phase-lock) -- identical to the demo.
 
     loop {
-        // In fallback mode (no DRM anchor) the socket wake drives the loop; in
-        // anchored mode the vblank wait below is the pace, so we must NOT
-        // block here -- a 5ms recv timeout aliases against the 8.3ms vblank
-        // grid and halves the emission to 60Hz.
+        // No DRM anchor: the anchor is required for proper shuttering, so this
+        // loop paces on the vblank wait below.  Without one we degrade to
+        // present-driven emission and poll the ring on a short timer instead of
+        // busy-spinning (the old one-byte UDP wake datagram is gone; the ring is
+        // the source of truth and was always re-checked within ~5 ms anyway).
         if drm_anchor.is_none() {
-            let _ = sock.recv_from(&mut buf);
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         // (Re)open the device if we don't have one.
@@ -2309,7 +2288,7 @@ pub fn run() {
                             }
                             // Pace the fire target with the anchor's OWN
                             // `frame_start`/`frame_end` -- the exact pair the
-                            // working 3dv3d demo uses to drive the emitter
+                            // working nvstereo-calibrate demo uses to drive the emitter
                             // (and, below, the reference both the old full-
                             // resync and the hand-rolled `next_present_us`
                             // clock drifted from).  `frame_start` SNAPS the
@@ -2492,8 +2471,9 @@ pub fn run() {
                 }
                 // --- No DRM anchor: fire on the presents directly. ------
                 // Timing quality is limited without the anchor (packets go out
-                // on wake arrival); fix the anchor permissions instead of
-                // tuning here.  The eye still comes from the game's ring.
+                // as the ring is polled on the timer above); fix the anchor
+                // permissions instead of tuning here.  The eye still comes from
+                // the game's ring.
                 None => {
                     if alive {
                         if let Some(eye) = pending.next_eye_present_driven() {

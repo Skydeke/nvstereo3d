@@ -1,0 +1,45 @@
+# Maintainer: Skydeke
+#
+# In-repo VCS PKGBUILD for nvstereo3d: clones the repo over SSH (needs your
+# GitHub SSH key) and builds HEAD of the default branch.  The version is the
+# Cargo.toml version plus the commit count (e.g. 0.1.0.r42), so it works with
+# or without tags.  The udev rule for emitter access is installed along with
+# the binaries.
+
+pkgname=nvstereo3d-git
+pkgver=0.1.0.r5
+pkgrel=1
+pkgdesc="NVIDIA 3D Vision IR emitter on Linux: nvstereo3d host bridge for wiz3D under Wine + nvstereo-calibrate tuning demo"
+arch=('x86_64')
+url="https://github.com/Skydeke/${pkgname%-git}"
+license=('MIT' 'Apache-2.0')
+depends=('libdrm' 'libgl' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxkbcommon' 'wayland')
+makedepends=('rust' 'pkg-config' 'git')
+provides=("${pkgname%-git}")
+conflicts=("${pkgname%-git}")
+source=("$pkgname::git+ssh://git@github.com/Skydeke/${pkgname%-git}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$pkgname"
+    local ver
+    ver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+    [[ -z "$ver" ]] && ver="0.1.0"
+    echo "$ver.r$(git rev-list --count HEAD)"
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    install -Dm755 "$srcdir/target/release/nvstereo3d" \
+        "$pkgdir/usr/bin/nvstereo3d"
+    install -Dm755 "$srcdir/target/release/nvstereo-calibrate" \
+        "$pkgdir/usr/bin/nvstereo-calibrate"
+    install -Dm644 "98-nvstusb.rules" \
+        "$pkgdir/usr/lib/udev/rules.d/98-nvstusb.rules"
+}

@@ -30,11 +30,11 @@ mod stamp_diag;
 mod stereo_helper;
 mod text;
 
-/// Shared-memory ring coupling the `nvstereo3d-host` helper to wiz3D's
+/// Shared-memory ring coupling the `nvstereo3d` helper to wiz3D's
 /// `Nvidia3DOutput.dll` (see [`host`]).
 pub mod shm;
 
-/// The `nvstereo3d-host` helper logic (a thin `main` in `src/bin`).
+/// The `nvstereo3d` helper logic (a thin `main` in `src/bin`).
 pub mod host;
 
 use gl::Gl;
@@ -952,7 +952,7 @@ impl App {
     /// to `monitor_timings.json` under the active monitor's `VENDOR_PRODUCT_REFRESH`
     /// key (from its EDID, e.g. `ACI_23F7_120`).  The DB holds only the user's
     /// own tuned monitors, so `s` replaces the file with just this entry.
-    /// Bound to `s`. The saved entry is what `nvstereo3d-host` and the demo
+    /// Bound to `s`. The saved entry is what `nvstereo3d` and the demo
     /// itself re-read at startup, so tuning a monitor once and pressing `s`
     /// persists it across runs.
     fn save_timings(&mut self) {

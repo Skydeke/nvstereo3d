@@ -1,6 +1,6 @@
 //! Raw control-in probe diagnostic for the NVIDIA 3D Vision USB IR emitter.
 //!
-//! 3dv3d's `NvstusbContext::set_rate` collapses the timing-register readback
+//! nvstereo-calibrate's `NvstusbContext::set_rate` collapses the timing-register readback
 //! into a Some/None verdict ("TIMING REGS LIVE" vs "TIMING REGS IGNORED").
 //! This tool replays the exact same protocol steps but prints *everything*
 //! the device answers, so a failed readback can be told apart from a read
@@ -141,7 +141,7 @@ fn main() {
     block[16..24].copy_from_slice(&[0x30, 0x28, 0x24, 0x22, 0x0a, 0x08, 0x05, 0x04]);
     block[24..28].copy_from_slice(&z.to_le_bytes());
 
-    println!("--- configure writes (identical to 3dv3d's configure) ---");
+    println!("--- configure writes (identical to nvstereo-calibrate's configure) ---");
     write_cmd(&handle, "timings block (28B)", &block);
     write_cmd(
         &handle,
