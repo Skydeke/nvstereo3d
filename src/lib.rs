@@ -26,6 +26,7 @@ pub mod nvtimings;
 mod pulsar;
 mod scene;
 mod screenshot;
+mod stamp_diag;
 mod stereo_helper;
 mod text;
 

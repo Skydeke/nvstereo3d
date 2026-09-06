@@ -85,6 +85,16 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// DIAG: wall-clock seconds, so log lines can be correlated against when the
+/// viewer noticed a swapped-eye frame during play. Not used for any timing
+/// logic -- diagnostics only.
+fn diag_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Per-second telemetry for the fired eye stream (see main loop).  The glasses
 /// only lock into master mode when consecutive packets strictly alternate
 /// L/R and the period is inside the emitter's lock window.
@@ -108,6 +118,28 @@ struct StreamStats {
 
 const MASTER_LOCK_MIN_US: u64 = 7600;
 const MASTER_LOCK_MAX_US: u64 = 9000;
+
+/// Hard lower bound on the inter-packet cadence the host will emit, even across
+/// a pathological shorten after a drift/re-anchor timing collapse.
+///
+/// The trace's end-of-session lock loss showed `period 6779us < MASTER_LOCK_MIN_US`
+/// measurably -- a single compressed inter-fire gap (two `send_eye` calls closer
+/// than one display period, which the `frame_end` phase-preserving re-anchor's
+/// +/-half-period window permits when the overdue-drop rebaseline perturbs the
+/// fire schedule) that put the stream outside the emitter's master-lock window
+/// and made the glasses "will NOT lock".  Because the emitter only locks when
+/// consecutive packets sit inside its [7600, 9000]us window, ONE sub-window gap
+/// is all it takes to drop lock for the session.
+///
+/// This constant is the fire-site backstop: before emitting an eye, if the
+/// computed deadline would fire within `LOCK_MIN_FIRE_GAP_US` of the previous
+/// send, the packet is held a few hundred us so the cadence never dips below
+/// the window.  It fires at most once per pathological shorten (never in steady
+/// 120 Hz), so the single packet is merely a touch early -- a far smaller
+/// artifact than a full lock drop.  `frame_end(Some(vblank_us))` still confirms
+/// against the TRUE kernel vblank afterwards, so the schedule stays pinned to
+/// the real display grid regardless of this hold.
+const LOCK_MIN_FIRE_GAP_US: u64 = 7900;
 
 /// The glasses tolerate a handful of dropped/repeated eyes per second before the
 /// stream is treated as unlocked -- a near-boundary mis-pin or a freerun/resume
@@ -158,7 +190,8 @@ fn fire_lead_us() -> u64 {
 /// after `t`.  A present submitted at `t` blocks until its own boundary, so
 /// the strictly-after mapping puts every stamped swap on the exact display
 /// slot it scans out on (mid-period submit -> that boundary, after-boundary
-/// submit -> the next one).
+/// submit -> the next one).  NOTE: this mapping is now used only for stamp
+/// diagnostics (`stamp_diag::log_swap`); pinning is always FIFO.
 ///
 /// The grid is uniform, so `ref_boundary` serves only as an ORIGIN: the answer
 /// is `ref_boundary + n*period` for the signed `n` that lands the first
@@ -177,17 +210,44 @@ fn fire_lead_us() -> u64 {
 /// dropped by `next_eye`'s overdue logic rather than replayed onto the wrong
 /// slot.
 ///
-/// NOTE: production pinning no longer feeds on the producer's submit stamp
-/// (Wine/Proton buffering makes it many periods stale); `ingest` pins FIFO to
-/// the host grid instead.  This pure grid-mapping function is kept for the
-/// tests that document the mapping semantics.
-#[cfg(test)]
-fn boundary_after(ref_boundary: u64, period: u64, t: u64) -> u64 {
+/// The input `t` must already be on the host-epoch clock, i.e. the producer
+/// stamp CORRECTED by the DLL-clock offset (see `stamp_diag::offset_est`).
+/// Applied to the raw stamp it landed the whole schedule a constant number of
+/// periods behind the armed grid (the 28-32-period Wine epoch offset measured
+/// on hardware) -- every eye dropped OVERDUE, the host freeran every slot,
+/// and the long-freerun hold left the glasses dark.  FIFO pinning is immune
+/// to that offset (the only pinning path).  The stamped-pinning path that
+/// re-used this function (`stamped_pin` adds one period) is RETIRED: on
+/// hardware it moved the shuttering off the armed-service grid and broke clean
+/// shuttering; see the `EyeQueue` module docs.
+pub(crate) fn boundary_after(ref_boundary: u64, period: u64, t: u64) -> u64 {
     let period = period.max(1);
     // `div_euclid` rounds toward -inf, so an eye submitted before the origin
     // lands in the correct past lattice slot (not clamped to origin + period).
     let n = (t as i64 - ref_boundary as i64).div_euclid(period as i64) + 1;
     (ref_boundary as i64 + n.saturating_mul(period as i64)).max(0) as u64
+}
+
+/// The boundary the ARMED grid serves a stamped swap on: one full display
+/// period AFTER the frontier slot [`boundary_after`] picks.  The host fires
+/// every eye one slot AHEAD of the just-confirmed vblank
+/// (`armed = confirmed + period`; see the drain loop), and the content that
+/// blocks to `boundary_after(t)` is what armed is serving one slot later -- so
+/// the eye is due exactly when the armed grid reaches `boundary_after(t) +
+/// period`.
+///
+/// Pinning the eye to `boundary_after(t)` itself (the +0 form) parked it a
+/// whole period BEHIND the armed boundary, where `next_eye`'s due-window edge
+/// (`b + half < boundary`) drops it OVERDUE and the host freeruns an invented
+/// eye in its place -- measured on hardware as "NVSTUSB_STAMP_PIN=1 no longer
+/// shuts the glasses cleanly".  This is the same lesson the top-drain FIFO pin
+/// already learned: it MUST be `last_vblank + 2*period` (the armed boundary),
+/// not `last_vblank + period`, for the identical reason.  With the +period the
+/// stamped schedule aligns slot-for-slot with the FIFO schedule that demonstrably
+/// locks and shutters cleanly, while the absolute slot still comes from the
+/// stamp + measured offset (deterministic start phase).
+pub(crate) fn stamped_pin(ref_boundary: u64, period: u64, converted: u64) -> u64 {
+    boundary_after(ref_boundary, period, converted).saturating_add(period.max(1))
 }
 
 /// Backlog threshold for the eye schedule: when queued presents exceed this we
@@ -196,6 +256,29 @@ fn boundary_after(ref_boundary: u64, period: u64, t: u64) -> u64 {
 /// frames deep so a genuine stall re-anchors while normal interleaved drainage
 /// never trips it.
 const MAX_QUEUE: usize = 8;
+
+/// Stuck-ahead purge threshold: `ingest` clears the whole schedule when its
+/// OLDEST pinned eye sits more than HALF a display period PAST the frontier
+/// being armed.  Half a period is exactly `next_eye`'s due window, so a front
+/// beyond it cannot fire on that slot; and once the `pending_reanchor`
+/// re-anchor loop is live, the same front is re-pinned FORWARD again on every
+/// drain (`rebaseline` onto the far-ahead fresh eye), so it never ages into
+/// the window either: no eye is ever due, every slot freeruns an invented eye
+/// with arbitrary parity vs. the display, and the automatic inversion detector
+/// starves for real DLL eyes.  A sustaining storm therefore REQUIRES the front
+/// to sit past `armed + period/2` at drain time, and probing the frontier
+/// `guess` (== the armed boundary) there catches it deterministically:
+///   * trace.log's earlier storm parked the front 2-4 periods past every armed
+///     boundary (~978 re-anchors in one session);
+///   * phase 3 of the newest trace parks it at ~0.86*period past `guess` at
+///     every non-empty drain -- inside the 2*period tolerance the previous
+///     guard allowed (whence that storm survived), but still past the due
+///     window (whence it can never fire).
+/// `floored_next_boundary` is what lets the front get there: it extends the
+/// schedule at `tail + period`, so a queue that ever STOPS draining marches its
+/// front forward at exactly the rate the armed boundary advances.  Healthy flow
+/// keeps the front INSIDE the due window (trace shows <= ~0.05*period of
+/// jitter), so this edge never trips there.
 
 /// Consecutive freerun (invented, no-DLL-eye) fires before the stream is
 /// treated as having come back from a dip.  A single slot here, when the
@@ -218,6 +301,54 @@ const MAX_QUEUE: usize = 8;
 /// one-slot blip (normal healthy micro-jitter) still deliberately skips the
 /// re-anchor.
 const DIP_RESYNC_AFTER_FREERUN_SLOTS: u32 = 2; // ~17 ms at 120 Hz
+
+/// Maximum the FIFO schedule's front may lag the armed display grid before
+/// `next_eye` re-baselines the queue onto the grid (a fraction of the period).
+///
+/// The pin chain that places drained swaps on the grid advances with the
+/// anchor's measured `period_us`, which carries a tiny systematic error (a
+/// fraction of a us/frame) against the display's true cadence.  The target the
+/// host actually arms is corrected to the REAL vblanks every frame
+/// (`frame_end`'s phase-preserving re-anchor), but the already-pinned eyes in
+/// the queue are never re-corrected -- so the front falls progressively
+/// further behind the armed grid.  Trace.log shows this accumulating to ~half
+/// a period over ~2 minutes (`gap_from_armed` growing 0 -> ~4140us right
+/// before the overdue re-anchor).
+///
+/// That matters for THREE separate failure modes, all observed at the
+/// end-of-session overdue re-anchor:
+///   * SHUTTER-vs-IMAGE mismatch: the host fires each eye at its PINNED
+///     boundary, which lags its true display slot by the accumulated error.
+///     Past ~a quarter period this opens the shutter recognizably off-slot,
+///     and at a half period it is a FULL slot off -- the viewer sees the
+///     opposite eye's image at that slot = inverted depth, exactly the
+///     "inversion at the end" the user reports.
+///   * The overdue-drop path only re-anchors when the front is more than HALF
+///     a period behind -- and at that point the re-baseline's sub-period
+///     normalization is sitting exactly on the polarity-ambiguous midpoint, so
+///     the correction is a 50/50 coin toss that can latch the whole stream one
+///     slot over (a genuine, persistent inversion).
+///   * The automatic inversion detector is STRUCTURALLY blind to this: it
+///     compares the fired-eye SEQUENCE at arming-target parity, and the
+///     sequence is unchanged by the drift -- only the targets themselves drift
+///     off the true grid, which the detector has no reference for.
+///
+/// Re-baselining EARLY (well before half a period) cures all three: the
+/// sub-period shift is small, its direction is unambiguous (the front is
+/// clearly "the next slot behind the armed grid", not a coin-flip), and the
+/// eye->slot pairing is preserved by construction (`rebaseline` shifts the
+/// whole surviving schedule by the same sub-period amount and never steps a
+/// whole slot).  The shutter then always opens within ~1/8 period of its true
+/// slot -- invisible.  At ~30us/sec drift this fires about once every ~30s
+/// with a <= ~period/8 shift, so it never perturbs the stream.  A stall is
+/// NOT drift (the armed grid jumps whole slots while the schedule stays on
+/// the display grid), so the overdue path drops stall-scanned eyes WITHOUT
+/// re-baselining (see `next_eye`'s on-grid drop-only branch) -- only genuine
+/// off-grid drift takes the full re-baseline path.
+///
+/// The units are FRACTIONS OF `period` computed at the call site (`period/8`),
+/// so the bound scales with the display rate.
+const DRIFT_LAG_ALIGN_PERIOD_DIV: u64 = 8;
 
 /// Consecutive freerun fires after which the host stops MANUFACTURING
 /// alternation and just holds the last eye instead.  Toggling every ~8.3ms
@@ -249,26 +380,194 @@ fn stall_hold_after_freerun_slots() -> u32 {
         .unwrap_or(STALL_HOLD_AFTER_FREERUN_SLOTS)
 }
 
+/// Number of consecutive, same-parity, REAL (non-freerun) fires the detector
+/// must observe before it locks the inversion reference.
+///
+/// The naive detector locked its reference on the FIRST real fire, which
+/// happens during the chaotic start-of-session thrash (trace.log shows several
+/// re-anchors and freeruns in the opening seconds).  That locked an arbitrary
+/// early phase as "correct".  Worse, it is exactly this window where the
+/// FIFO/re-anchor polarity is still a coin-flip, so a reference locked there
+/// can be a slot off -- after which the detector is permanently blind: every
+/// later same-parity fire matches the (wrong) reference and a genuine mid-
+/// session flip reads as "no change, invert=0, zero 'inversion detected'"
+/// (the exact signature of trace.log's end-of-session eye swap the user saw).
+///
+/// Requiring this many CONSISTENT same-parity real fires before locking lets
+/// the startup thrash settle: until the phase is steady (no oscillation, no
+/// re-anchor storm) the accumulator keeps resetting, so the reference only
+/// locks once the session has proven a stable, trustworthy phase.  From that
+/// point on it stays locked, so a real slot-flip later (e.g. the end-of-session
+/// drift re-anchor re-committing the wrong phase) IS detected and toggles
+/// FLAG_INVERT_EYES.  ~0.5s at 120Hz (two real eyes/frame on 60fps content).
+const INVERSION_REF_STABLE_FIRES: u32 = 120;
+
+/// Tracks the reference for automatic eye-inversion detection.
+///
+/// The glasses lock to whatever eye the host fired at lock-in and keep that
+/// phase for the whole session.  `ref_phase` records that locked eye at the
+/// reference boundary `ref_boundary`; at any later SAME-PARITY boundary the
+/// glasses still show `ref_phase`.  If a real DLL eye fires the opposite eye
+/// at such a boundary, the fired↔display pairing has shifted one slot and
+/// FLAG_INVERT_EYES must be toggled so the renderer swaps which eye it
+/// renders -- the glasses' shutter timing is never adjusted.
+///
+/// The reference is NOT taken from the very first real fire (that can land
+/// during the startup re-anchor/freerun thrash, locking a slot-off phase and
+/// blinding the detector -- see `INVERSION_REF_STABLE_FIRES`).  Instead a
+/// candidate accumulator waits for consistent same-parity real fires before
+/// locking, so the reference reflects the session's proven, stable phase.
+#[derive(Clone, Copy)]
+struct InversionState {
+    ref_boundary: Option<u64>,
+    ref_phase: Option<bool>,
+    /// Candidate lock-in: the (boundary, phase) pair currently under test and
+    /// how many consistent same-parity real fires have endorsed it.
+    cand_boundary: Option<u64>,
+    cand_phase: Option<bool>,
+    cand_count: u32,
+}
+
+impl Default for InversionState {
+    fn default() -> Self {
+        InversionState {
+            ref_boundary: None,
+            ref_phase: None,
+            cand_boundary: None,
+            cand_phase: None,
+            cand_count: 0,
+        }
+    }
+}
+
+impl InversionState {
+    /// Observe one real (non-freerun) fire at boundary `target` with
+    /// period `period`.  Returns `true` when the caller must toggle
+    /// `FLAG_INVERT_EYES`.
+    fn observe(&mut self, target: u64, period: u64, fired: bool) -> bool {
+        // Already locked?  Straight same-parity comparison against the
+        // reference (the stable, proven phase).
+        if let (Some(rb), Some(rp)) = (self.ref_boundary, self.ref_phase) {
+            if target % (period * 2) == rb % (period * 2) {
+                return fired != rp;
+            }
+            return false;
+        }
+        // Not locked yet: accumulate a stable reference from consistent
+        // SAME-PARITY real fires.  Only same-parity boundaries are
+        // comparable (different parity always fires the opposite eye = normal
+        // alternation, which must not disturb the candidate).
+        let p2 = (period * 2).max(1);
+        let parity = target % p2;
+        match (self.cand_boundary, self.cand_phase) {
+            // No candidate yet: this fire starts one.
+            (None, _) => {
+                self.cand_boundary = Some(target);
+                self.cand_phase = Some(fired);
+                self.cand_count = 1;
+                false
+            }
+            // Same parity as the candidate.
+            (Some(cb), Some(cp)) if cb % p2 == parity => {
+                if fired == cp {
+                    self.cand_count += 1;
+                    if self.cand_count >= INVERSION_REF_STABLE_FIRES {
+                        // Proven stable: promote candidate -> reference.
+                        self.ref_boundary = self.cand_boundary;
+                        self.ref_phase = self.cand_phase;
+                        self.cand_boundary = None;
+                        self.cand_phase = None;
+                        self.cand_count = 0;
+                    }
+                    false
+                } else {
+                    // Same vertex, different eye: the phase is still unsettled
+                    // (startup re-anchor/freerun thrash, or a genuine blip
+                    // before we've locked).  Restart the accumulator on this
+                    // fire rather than locking a slot-off candidate.
+                    self.cand_boundary = Some(target);
+                    self.cand_phase = Some(fired);
+                    self.cand_count = 1;
+                    false
+                }
+            }
+            // Different parity (normal alternation): does not disturb the
+            // candidate, does not lock anything.
+            _ => false,
+        }
+    }
+
+    /// Drop the reference (and any in-progress candidate) so it is re-
+    /// established from later real fires.  Used after a manual button
+    /// correction, a re-anchor, or a game restart (the paired phase is
+    /// intentionally re-committed).
+    fn clear(&mut self) {
+        self.ref_boundary = None;
+        self.ref_phase = None;
+        self.cand_boundary = None;
+        self.cand_phase = None;
+        self.cand_count = 0;
+    }
+}
+
 /// The eye source, in two modes.
 ///
 /// STAMPED (version-2 ring): the producer stamps each swap with a
-/// CLOCK_MONOTONIC PRESENT time in `Swap::boundary_us`.  We deliberately do NOT
-/// convert that stamp onto the host grid to pin the eye (the old
-/// `boundary_after(host_us_from_mono(stamp))` path): under Wine the DLL's QPC
-/// epoch does not coincide with the host's CLOCK_MONOTONIC boot epoch that
-/// `host_us_from_mono` subtracts, so the mapping translated the whole schedule
-/// a constant number of periods behind `armed` (observed ~28 = 233324us) --
-/// every eye dropped OVERDUE, the host freeran every slot, and the long-freerun
-/// hold let the glasses sit dark.  Production pinning is therefore pure FIFO
-/// onto the host's OWN anchored grid (below), immune to that epoch offset.  The
-/// stamp is kept on the wire (fixed-size ring layout) and the `boundary_after`
-/// mapping is retained as `#[cfg(test)]` documentation of the mapping.
+/// CLOCK_MONOTONIC PRESENT time in `Swap::boundary_us`, which the stamp
+/// diagnostics (`NVSTUSB_STAMP_DIAG=1`) used to measure the DLL-clock offset.
+/// That stamp is NOT used for pinning: mapping it onto the grid either lands
+/// the schedule a constant number of periods behind the armed grid (the old
+/// epoch-offset failure) or, when resolved to `boundary_after`, shifts the
+/// shuttering off the armed-service grid (both broke clean shuttering).
+/// FIFO pinning -- the clean shutter/phase path -- is the one-and-only pinning
+/// (see below).
+/// ## FIFO pinning (the one-and-only path)
 ///
-/// FIFO (both stamped and legacy rings): each drained swap is pinned to the
-/// next unassigned boundary on the host's anchored grid, advancing one period
-/// per swap in drain order.  The swap that arrives is the next eye the display
-/// will show, so FIFO pinning to the next free slot is correct and stable while
-/// the ring stays fed.
+/// Each drained swap is pinned to the next unassigned boundary on the host's
+/// anchored grid, advancing one period per swap in drain order.  The swap that
+/// arrives is the next eye the display will show, so FIFO pinning to the next
+/// free slot is correct and stable while the ring stays fed -- this is the
+/// clean shutter/phase that demonstrably locks on hardware.
+///
+/// When an occasional (mid-session) inversion is detected, the automatic
+/// detector toggles `FLAG_INVERT_EYES` so the RENDERER swaps which eye gets
+/// which image -- the glasses/shutter timing is untouched, so the correction
+/// cannot introduce the uncomfortable shuttering a shutter-timing shift would.
+///
+/// ## Residual start-phase lot (why a locked session can still be inverted)
+///
+/// FIFO pins the FIRST swap of a (re)started stream onto the currently-armed
+/// boundary; whether that boundary is the swap's ACTUAL display slot depends on
+/// the game's present->scanout buffer latency (1 vs. 2 vblanks -- an
+/// unobservable, per-session pipeline property).  When the two disagree by one
+/// slot the whole session is inverted from the first real fire onward, and the
+/// automatic inversion detector cannot see it: once the phase proves stable the
+/// detector locks it as the reference (see `INVERSION_REF_STABLE_FIRES`), so a
+/// STATICALLY inverted session reads as "stable, matched, invert=0" and the
+/// detector stays silent (`inversion detected` logs 0 for the entire session).
+/// The detector can only catch a MID-SESSION slot shift -- which the
+/// stabilization makes it reliably see even when the session started clean and
+/// flipped late (the end-of-session drift re-anchor path).  The observed trace
+/// #3 also showed a second FIFO-inversion path: a ~300ms startup stall froze
+/// `last_vblank_epoch`, FIFO pinned the first real swaps ~36 periods behind the
+/// armed grid, and the overdue-drop/re-anchor "recovery" committed a fresh
+/// phase on that wrong basis -- with the same result (static inversion,
+/// detector blind, `inversion detected` 0).  For those static-start cases,
+/// pressing the emitter's 3D button once toggles `FLAG_INVERT_EYES` (renderer
+/// swaps which eye it renders); that correction persists in the shared region
+/// across restarts until it is deliberately changed.
+///
+/// One startup coin flip the host DOES control and now eliminates: before the
+/// first real DLL eye fires, the schedule is fed only by startup backlog /
+/// degraded-path FIFO whose parity is ARBITRARY relative to the game's real
+/// alternation, and `next_eye` would FREERUN invented toggle eyes across that
+/// gap.  Whatever the glasses lock to at that first arbitrary pulse is a
+/// per-session 50/50 ("inverted at launch").  `first_dll_eye_fired` makes the
+/// host stay silent until the game's first real eye, so the FIRST IR pulse --
+/// and therefore the glasses' lock phase -- is a deterministic function of the
+/// game's own first reported eye.  If the resulting launch phase is still
+/// wrong, that is the content/glass-convention case only the button can fix.
+///
 ///
 /// The fired stream is a PURE function of what the game reported -- the host
 /// NEVER invents, drops-on-whim, or flips a real eye, so the game's constant
@@ -290,6 +589,25 @@ fn stall_hold_after_freerun_slots() -> u32 {
 ///     best-known recovery).
 ///   * RE-ANCHOR on backlog, never replay stale eyes: a fall-behind drops the
 ///     stale prefix and re-anchors on the newest eye.
+///   * STUCK-AHEAD purge (the re-anchor storm): FIFO's `tail + period` floor
+///     keeps extending the schedule as fast as the armed boundary advances, so
+///     a queue that ever STOPS draining parks its front PAST every boundary --
+///     nothing is ever due, every slot freeruns an invented eye, and the
+///     `pending_reanchor` re-anchor keeps re-baselining onto the far-ahead
+///     fresh eye (`reanchor boundary = SET boundary + ~4*period`; two storms in
+///     trace.log: ~978 re-anchors with the front 2-4 periods ahead, then in
+///     phase 3 ~1043 re-anchors with the front only ~0.86*period past the
+///     frontier -- inside the old 2-period tolerance but still past the due
+///     window).  That host-invented freerun has ARBITRARY parity vs. the
+///     display, so the observed result is an uninvertible fake-stream flip
+///     rather than the DLL-reported eye (`inversion detected` stays zero
+///     because no real eye ever fires).  `ingest` therefore purges any schedule
+///     whose front sits more than HALF a period past the frontier being armed
+///     (`purge_stuck_ahead`; the due-window edge -- healthy flow is far inside
+///     it), so the next drain re-anchors AT the frontier and real DLL eyes fire
+///     on-time again -- leaving the automatic inversion detector its real-eye
+///     observations to genuinely flip `FLAG_INVERT_EYES` when a true one-slot
+///     phase shift happens.
 struct EyeQueue {
     /// Fallback FIFO: `true` = right, in enqueue order.
     fallback: VecDeque<bool>,
@@ -321,6 +639,25 @@ struct EyeQueue {
     /// boundary.  Until then the schedule only ever freely runs, never fires a
     /// presumed-real eye that could bake a shifted phase into the stream.
     pending_reanchor: bool,
+    /// True when the MOST RECENTLY returned eye was a FREERUN (invented) rather
+    /// than a real DLL-reported eye.  The automatic inversion detector (host.rs
+    /// main loop) must only compare against real DLL eyes: a freerun toggles to
+    /// an arbitrary opposite eye that carries no DLL phase information, so
+    /// comparing it against the reference phase would fabricate spurious
+    /// inversions during every dip.
+    last_was_freerun: bool,
+    /// True once a REAL DLL-reported eye has fired (scheduled pin, fallback
+    /// pop, or present-driven pop) -- i.e. once the stream has a
+    /// game-derived phase the glasses can lock to.  Before that, the host must
+    /// stay SILENT (return `None`) rather than freerun: the startup backlog /
+    /// degenerate-path freerun eyes have ARBITRARY parity vs. the game's real
+    /// alternation, and whatever the glasses lock to at that first pulse is a
+    /// per-session 50/50 -- the "inverted at launch" coin flip the automatic
+    /// detector cannot see (it self-consistently locks the wrong phase as its
+    /// reference).  Delaying emission until this flag drops makes the FIRST
+    /// IR pulse (and hence the glasses' lock phase) a deterministic function of
+    /// the game's first real eye.
+    first_dll_eye_fired: bool,
 }
 
 impl Default for EyeQueue {
@@ -333,6 +670,8 @@ impl Default for EyeQueue {
             drops: DropDiagnostic::default(),
             stall_hold_after_freerun: STALL_HOLD_AFTER_FREERUN_SLOTS,
             pending_reanchor: false,
+            last_was_freerun: false,
+            first_dll_eye_fired: false,
         }
     }
 }
@@ -394,6 +733,27 @@ impl EyeQueue {
                 if self.freerun_since >= DIP_RESYNC_AFTER_FREERUN_SLOTS
                     || self.pending_reanchor
                 {
+                    // DIAG: distinguish a genuine dip-length reanchor
+                    // (freerun_since already crossed DIP_RESYNC_AFTER_FREERUN_SLOTS
+                    // on its own) from one that only fired because
+                    // `pending_reanchor` is set unconditionally by every single
+                    // freerun/overdue-drop (see next_eye) -- i.e. the
+                    // `>= DIP_RESYNC_AFTER_FREERUN_SLOTS` gate below is
+                    // currently bypassed. If `bypass=1` shows up on what was
+                    // actually just a 1-slot blip, that confirms the two-tier
+                    // design has collapsed into "always reanchor".
+                    let bypass = self.pending_reanchor
+                        && self.freerun_since < DIP_RESYNC_AFTER_FREERUN_SLOTS;
+                    eprintln!(
+                        "nvstusb-host: DIAG t={} reanchor freerun_since={} bypass={} \
+                         held_before={:?} -> right={} boundary={}",
+                        diag_ts(),
+                        self.freerun_since,
+                        bypass as u8,
+                        self.last_fired,
+                        right,
+                        t
+                    );
                     self.freerun_since = 0;
                     self.pending_reanchor = false; // fresh real eye consumed it
                     self.last_fired = Some(right);
@@ -438,34 +798,90 @@ impl EyeQueue {
         }
     }
 
+    /// The stuck-ahead purge: drops the whole schedule when its oldest pinned
+    /// eye points more than half a period PAST `guess` (the frontier the caller
+    /// is arming).  Half a period is `next_eye`'s due-window edge (`boundary <=
+    /// armed + period/2`), so such a front can never fire on the bound
+    /// being armed -- and once the `pending_reanchor` re-anchor loop is active
+    /// the same front is re-pinned forward on every drain, so it never ages
+    /// into the window either (the trace.log freerun/re-anchor storm; see the
+    /// `STUCK-AHEAD purge` docs).  Those pins are stale content whose later
+    /// firing would bake a re-lotted phase into the stream.  Called from
+    /// `ingest` for every drain.
+    fn purge_stuck_ahead(&mut self, guess: u64, period: u64) {
+        let limit = guess.saturating_add(period.saturating_div(2));
+        if let Some(front) = self.scheduled.front().map(|&(b, _)| b) {
+            if front > limit {
+                self.scheduled.clear();
+            }
+        }
+    }
+
     /// Ingests every swap from a drain, computing each eye's pinned boundary
     /// when the caller can convert its timestamp onto the anchored grid.
     /// Same-boundary collisions are resolved inside `enqueue`, against the
     /// live schedule, so a frame-sequential SIMPLE pair stays alternating even
     /// when its two eyes land in separate drains.
+    ///
+    /// Pin scheme: EVERY drain is pinned FIFO to the NEXT unassigned boundary
+    /// on the host's anchored grid -- the clean shutter/phase path.  The
+    /// `stamp_offset`/`use_stamp` stamped-pinning branch is RETIRED: the
+    /// caller always supplies `None` (the `NVSTUSB_STAMP_PIN` flag is a no-op),
+    /// so it never runs and a version-2 swap's submit stamp is intentionally
+    /// NOT used for pinning.  Off-grid stamped pinning moved the shuttering a
+    /// slot off the armed-service grid and broke clean shuttering on hardware;
+    /// an inverted session is instead corrected by the automatic detector
+    /// toggling `FLAG_INVERT_EYES` so the RENDERER swaps which eye gets which
+    /// image, with glass/shutter timing untouched.  The epoch-offset failure
+    /// that once shipped the whole schedule a constant number of periods behind
+    /// the armed grid (dropping every eye OVERDUE) is what ruled out stamp
+    /// pinning in the first place -- FIFO onto the host's own grid is immune to
+    /// it.
     fn ingest(
         &mut self,
         swaps: &[shm::Swap],
         anchor: Option<&drm::DrmVblank>,
+        period: u64,
         next_boundary: Option<u64>,
+        ref_vb: Option<u64>,
+        stamp_offset: Option<i64>,
     ) {
+        // Stamped pinning (via `use_stamp`) is RETIRED -- see the module docs.
+        // The caller supplies `stamp_offset = Some(..)` only through
+        // `pin_mode()`, which is permanently `false`, so `use_stamp` is always
+        // false at runtime and every swap takes the FIFO branch below.  The
+        // branch is kept (rather than deleted) only so the retired pinned-slot
+        // tests still type-check; it is never selected.
+        let use_stamp = ref_vb.is_some() && stamp_offset.is_some();
         // Each drained swap is pinned to the NEXT unassigned boundary on the
         // display grid in FIFO order: the host knows the grid from the DRM
         // anchor and advances it by one period per swap, so the swap that
         // arrives becomes the next eye the display will show.  We do NOT pin
         // from the producer's per-slot absolute PRESENT time
         // (`Swap::boundary_us`): under Wine the DLL's QPC epoch does not
-        // coincide with
-        // the host's CLOCK_MONOTONIC boot epoch that `host_us_from_mono`
-        // subtracts, so mapping it onto the grid translated the whole schedule
-        // a constant number of periods behind the armed boundary -- every eye
-        // dropped OVERDUE, the host freeran every slot, and the long-freerun
-        // hold let the glasses sit dark (see the module docs).  FIFO onto the
-        // host's own grid is immune to that epoch offset.  The existing
-        // `enqueue` re-spacing still handles bursty same-boundary pairs (e.g.
-        // 30fps where 2 eyes arrive in one game frame, often in separate
-        // top/late drains) by bumping the second eye forward.
-        let period = anchor.map_or(0, |a| a.period_us().max(1));
+        // coincide with the host's CLOCK_MONOTONIC boot epoch that
+        // `host_us_from_mono` subtracts, so mapping it onto the grid
+        // translated the whole schedule a constant number of periods behind
+        // the armed boundary -- every eye dropped OVERDUE, the host freeran
+        // every slot, and the long-freerun hold let the glasses sit dark (see
+        // the module docs).  FIFO onto the host's own grid is immune to that
+        // epoch offset.  The existing `enqueue` re-spacing still handles
+        // bursty same-boundary pairs (e.g. 30fps where 2 eyes arrive in one
+        // game frame, often in separate top/late drains) by bumping the second
+        // eye forward.
+        let period = period.max(1);
+        // Stuck-ahead storm guard: if the oldest pinned eye points more than
+        // HALF a period PAST the frontier this drain is arming, it can never
+        // fire on the boundary being armed (the due-window edge) -- and once
+        // the `pending_reanchor` re-anchor loop is live, the same front is
+        // re-pinned forward again on every drain, so it never ages into the
+        // window either: nothing is ever due, every slot freeruns an invented
+        // eye, and the automatic inversion detector starves for real DLL eyes.
+        // Clear the queue so this batch re-anchors the front at the frontier
+        // and the stream resumes with real, on-time DLL eyes.
+        if let Some(guess) = next_boundary {
+            self.purge_stuck_ahead(guess, period);
+        }
         // `next_boundary` is only the CALLER's guess at the earliest boundary
         // this batch could want (derived fresh from the DRM anchor each call,
         // e.g. `last_vblank + 2*period`) -- it does NOT know where the
@@ -483,10 +899,35 @@ impl EyeQueue {
         let mut boundary =
             next_boundary.map(|b| floored_next_boundary(self.scheduled.back().map(|&(t, _)| t), b, period));
         for s in swaps {
-            self.enqueue(s.eye == EYE_RIGHT, boundary, period);
-            if let Some(b) = boundary {
-                boundary = Some(b.saturating_add(period));
-            }
+            let assigned = if use_stamp {
+                match (ref_vb, stamp_offset, s.t_us) {
+                    (Some(rv), Some(off), Some(t_us)) => {
+                        // Convert the DLL's stamp onto the host epoch, add the
+                        // measured offset, and resolve the boundary the ARMED
+                        // grid serves the swap on: one period AFTER the slot
+                        // the present blocks to (`boundary_after` + period).
+                        // The +0 form parked the eye one period behind the
+                        // armed boundary, where `next_eye` drops it overdue and
+                        // the host freeruns an invented eye (the
+                        // dirty-shuttering failure observed with
+                        // NVSTUSB_STAMP_PIN=1).
+                        let naive = anchor.map_or(0, |a| a.host_us_from_mono(t_us));
+                        let converted = (naive as i64 + off).max(0) as u64;
+                        Some(stamped_pin(rv, period, converted))
+                    }
+                    // Unusable stamp: FIFO fallback from the frontier.
+                    _ => {
+                        let b = boundary;
+                        boundary = boundary.map(|bb| bb.saturating_add(period));
+                        b
+                    }
+                }
+            } else {
+                let b = boundary;
+                boundary = boundary.map(|bb| bb.saturating_add(period));
+                b
+            };
+            self.enqueue(s.eye == EYE_RIGHT, assigned, period);
         }
     }
 
@@ -556,18 +997,98 @@ impl EyeQueue {
                 dropped = true;
             }
             if dropped {
-                // The front falling > half a period behind the armed grid is
-                // proof the FIFO-pinned schedule has DRIFTED off the display
-                // grid.  Dropping the eye is necessary but not sufficient: the
-                // remaining queued eyes are still off-grid, and firing them at
-                // their drifted offsets would land one eye on the WRONG slot =
-                // a shifted (inverted) stream with no recovery.  Re-baseline
-                // the schedule onto the armed grid AT ONCE so the very next
-                // fire is grid-correct and deterministic, and mark the queue so
-                // `enqueue` also re-pins the held phase to the first fresh real
-                // eye that arrives.
-                self.rebaseline(boundary, period);
-                self.pending_reanchor = true;
+                // WHY the front fell > half a period behind the slot being
+                // armed decides the cure:
+                //   * CONTENT STALL (trace.log's end-of-session inversion): the
+                //     display kept vblanking while the game paused, so the armed
+                //     grid jumped whole slots ahead of a schedule that is still
+                //     ON the real display grid (its pins were stamped from real
+                //     vblanks, and the display grid never moved during a pause).
+                //     Dropping the scanned-out eyes is exactly right; RE-
+                //     BASELINING / RE-ANCHORING here is what shifted the whole
+                //     stream ~1 slot off (gap_from_armed -3260us, fire-gap
+                //     churn, "will NOT lock") and latched the inversion.
+                //   * GENUINE DRIFT: the pins really are off the grid
+                //     (sub-period lag accumulated to ~half), so the remaining
+                //     eyes MUST be re-baselined onto the armed grid or they fire
+                //     on the wrong slot, and the re-anchor flag re-pins the held
+                //     phase to the next fresh real eye.
+                // Tell them apart by the next survivor's offset from the grid:
+                // within +/-period/4 of a whole-slot multiple -> on-grid stall
+                // (drop-only, phase stays authoritative) -- otherwise genuine
+                // drift (rebaseline + re-anchor).
+                let on_grid = self.scheduled.front().map_or(true, |&(b, _)| {
+                    let d = (boundary as i64 - b as i64).rem_euclid(period as i64);
+                    d.min(period as i64 - d) <= (period / 4) as i64
+                });
+                if on_grid {
+                    eprintln!(
+                        "nvstusb-host: DIAG t={} overdue drop-only (on-grid stall): \
+                         front_next={} boundary={boundary} overdue_total={}",
+                        diag_ts(),
+                        self.scheduled
+                            .front()
+                            .map(|&(b, _)| b)
+                            .map_or(-1, |b| b as i64),
+                        self.drops.overdue
+                    );
+                } else {
+                    self.rebaseline(boundary, period);
+                    if !self.pending_reanchor {
+                        eprintln!(
+                            "nvstusb-host: DIAG t={} pending_reanchor SET (overdue) \
+                             overdue_total={} boundary={boundary}",
+                            diag_ts(),
+                            self.drops.overdue
+                        );
+                    }
+                    self.pending_reanchor = true;
+                }
+            }
+            // Early drift re-sync (see `DRIFT_LAG_ALIGN_PERIOD_DIV`): the pin
+            // chain's tiny systematic period error accumulates, so the front
+            // slips progressively behind the armed grid (trace.log
+            // `gap_from_armed` growing 0 -> ~half a period across a ~2min
+            // session).  Re-baseline LONG before the half-period overdue point
+            // so the shift stays small and pairing-preserving (never a whole
+            // slot), the shutter always opens within ~period/8 of its true
+            // slot, and the polarity-ambiguous overdue overhaul above never has
+            // to fire on a healthy stream.  The automatic inversion detector
+            // is structurally blind to this drift (it compares the fired-eye
+            // SEQUENCE at arming-target parity, and the sequence is unchanged
+            // while the targets themselves drift off the grid) -- so this is
+            // the one reliable defense, and keeping the lag bounded is what
+            // prevents the end-of-session wrong-depth the user sees.
+            if !self.pending_reanchor {
+                let align_limit = period / DRIFT_LAG_ALIGN_PERIOD_DIV;
+                if let Some(front) = self.scheduled.front().map(|&(b, _)| b) {
+                    let lag = boundary as i64 - front as i64;
+                    if lag > align_limit as i64 {
+                        self.rebaseline(boundary, period);
+                        eprintln!(
+                            "nvstusb-host: DIAG t={} drift re-sync: front {front} lagging \
+                             armed {boundary} by > period/{} -> rebaselined onto grid",
+                            diag_ts(),
+                            DRIFT_LAG_ALIGN_PERIOD_DIV
+                        );
+                    } else if lag < -(align_limit as i64) {
+                        // Mirror of the lagging drift re-sync: after a recovery
+                        // (or a boundary that snapped back) the front can sit
+                        // pinned MORE than period/8 AHEAD of the armed grid --
+                        // firing it then opens the shutter EARLY onto the
+                        // previous slot (the trace.log -3260us post-stall
+                        // transient).  Re-baseline it back onto the armed grid:
+                        // a small, pairing-preserving sub-period shift (`rebaseline`'s
+                        // normalization handles either direction).
+                        self.rebaseline(boundary, period);
+                        eprintln!(
+                            "nvstusb-host: DIAG t={} drift re-sync: front {front} LEADING \
+                             armed {boundary} by > period/{} -> rebaselined onto grid",
+                            diag_ts(),
+                            DRIFT_LAG_ALIGN_PERIOD_DIV
+                        );
+                    }
+                }
             }
             // Due: every front entry within +/-half belongs to this boundary
             // (the phase-preserving nudge moves the armed slot by sub-periods
@@ -589,6 +1110,19 @@ impl EyeQueue {
                 self.drops.coalesced = self.drops.coalesced.saturating_sub(1);
                 self.last_fired = Some(e);
                 self.freerun_since = 0; // real DLL eye -> phase authoritative
+                self.last_was_freerun = false;
+                if !self.first_dll_eye_fired {
+                    self.first_dll_eye_fired = true;
+                    if crate::stamp_diag::enabled() {
+                        eprintln!(
+                            "nvstusb-host: DIAG t={} first real eye {:?} fired on its stamped \
+                             boundary {boundary} -- the glasses' lock phase is now a function of \
+                             the game's eye, not startup freerun parity",
+                            diag_ts(),
+                            if e { "R" } else { "L" }
+                        );
+                    }
+                }
                 return Some(e);
             }
             // None due: freerun.  Toggle to the opposite eye so the fired
@@ -598,6 +1132,14 @@ impl EyeQueue {
             // no longer a blip but a real stall -- stop toggling and hold the
             // last eye so a stuck/stale frame isn't strobed (see the constant's
             // doc comment).
+            // Pre-first-eye: there is NO established phase to hold yet, and a
+            // freerun-invented eye here would be the arbitrary-parity pulse
+            // the glasses lock to (the "inverted at launch" 50/50).  Stay
+            // SILENT instead -- the game's first real eye (whenever it arrives)
+            // becomes the first IR pulse and the lock phase is deterministic.
+            if !self.first_dll_eye_fired {
+                return None;
+            }
             self.freerun_since = self.freerun_since.saturating_add(1);
             self.drops.freerun += 1;
             // The freerun INVENTED this eye (the game never reported it for
@@ -605,24 +1147,77 @@ impl EyeQueue {
             // Glue the next fresh DLL eye to a grid re-baseline so the resumed
             // stream cannot inherit this invented parity (which is the 50/50
             // "eyes swapped after a dip" source).
-            self.pending_reanchor = true;
+            //
+            // FIX (was unconditional): only latch this on a genuine dip
+            // (freerun_since >= DIP_RESYNC_AFTER_FREERUN_SLOTS), matching the
+            // documented two-tier design. Setting it on every single-slot
+            // blip (freerun_since==1) made `enqueue`'s own `>= 2` gate dead
+            // code and forced a full reanchor on literally every incoming
+            // swap during steady content -- trace.log showed 1431/1437
+            // reanchors (99.6%) were this bypass, meaning the schedule was
+            // never once settling into a clean on-time `due` fire, session-
+            // long, before a real stall hit.
+            if self.freerun_since >= DIP_RESYNC_AFTER_FREERUN_SLOTS {
+                if !self.pending_reanchor {
+                    eprintln!(
+                        "nvstusb-host: DIAG t={} pending_reanchor SET (freerun, scheduled) \
+                         freerun_since={} boundary={boundary}",
+                        diag_ts(),
+                        self.freerun_since
+                    );
+                }
+                self.pending_reanchor = true;
+            }
             if self.freerun_since > self.stall_hold_after_freerun {
+                self.last_was_freerun = self.freerun_since > 0;
                 return self.last_fired;
             }
+            self.last_was_freerun = true;
             return self.last_fired.map(|r| freerun(&mut self.last_fired, r));
         }
         if let Some(e) = self.fallback.pop_front() {
             self.last_fired = Some(e);
             self.freerun_since = 0; // real DLL eye -> phase is authoritative
+            self.last_was_freerun = false;
+            if !self.first_dll_eye_fired {
+                self.first_dll_eye_fired = true;
+                if crate::stamp_diag::enabled() {
+                    eprintln!(
+                        "nvstusb-host: DIAG t={} first real eye {:?} fired from the FIFO \
+                         backlog -- the glasses' lock phase is now a function of the game's eye, \
+                         not startup freerun parity",
+                        diag_ts(),
+                        if e { "R" } else { "L" }
+                    );
+                }
+            }
             Some(e)
         } else if let Some(r) = self.last_fired {
             // Scheduled empty AND fallback empty: a dip in the degraded path.
+            // Pre-first-eye: stay silent (no invented pulse for the glasses to
+            // lock onto) -- see next_eye's freerun guard above.
+            if !self.first_dll_eye_fired {
+                return None;
+            }
             self.freerun_since = self.freerun_since.saturating_add(1);
             self.drops.freerun += 1;
-            self.pending_reanchor = true;
+            // FIX: same gate as above -- see the comment there.
+            if self.freerun_since >= DIP_RESYNC_AFTER_FREERUN_SLOTS {
+                if !self.pending_reanchor {
+                    eprintln!(
+                        "nvstusb-host: DIAG t={} pending_reanchor SET (freerun, fallback) \
+                         freerun_since={}",
+                        diag_ts(),
+                        self.freerun_since
+                    );
+                }
+                self.pending_reanchor = true;
+            }
             if self.freerun_since > self.stall_hold_after_freerun {
+                self.last_was_freerun = self.freerun_since > 0;
                 return self.last_fired;
             }
+            self.last_was_freerun = true;
             Some(freerun(&mut self.last_fired, r))
         } else {
             None
@@ -636,13 +1231,27 @@ impl EyeQueue {
         if let Some((_, r)) = self.scheduled.pop_front() {
             self.last_fired = Some(r);
             self.freerun_since = 0;
+            self.last_was_freerun = false;
+            self.first_dll_eye_fired = true;
             Some(r)
         } else if let Some(e) = self.fallback.pop_front() {
             self.last_fired = Some(e);
             self.freerun_since = 0;
+            self.last_was_freerun = false;
+            self.first_dll_eye_fired = true;
             Some(e)
         } else {
-            self.last_fired
+            // Pre-first-eye: never repeat an invented/held phase before the
+            // first real DLL eye (see the `first_dll_eye_fired` doc comment).
+            let held = if self.first_dll_eye_fired {
+                self.last_fired
+            } else {
+                None
+            };
+            if held.is_some() {
+                self.last_was_freerun = true;
+            }
+            held
         }
     }
 
@@ -680,6 +1289,11 @@ impl EyeQueue {
         self.scheduled.front().map(|&(b, _)| b)
     }
 
+    /// TEMP DEBUG: tail scheduled boundary (pinned boundary of the newest eye).
+    fn tail_boundary(&self) -> Option<u64> {
+        self.scheduled.back().map(|&(b, _)| b)
+    }
+
     /// Full reset (game stop / re-anchor): queue AND held eye cleared so the
     /// next stream starts from a clean phase reference.
     fn reset(&mut self) {
@@ -688,6 +1302,7 @@ impl EyeQueue {
         self.last_fired = None;
         self.freerun_since = 0;
         self.pending_reanchor = false;
+        self.last_was_freerun = false;
     }
 }
 
@@ -1029,6 +1644,14 @@ pub fn run() {
     }
     eprintln!("nvstusb-host: shared region '{}' ready (cap {})", shm_path, shm.cap());
     shm.set_status(STATUS_OPENING);
+    eprintln!(
+        "nvstusb-host: if depth looks INVERTED at launch (a wrong start-phase, which the \
+         automatic detector cannot see), press the emitter's 3D button once to swap eyes. \
+         The button fix is persistent (shared region), so after one press it stays \
+         corrected for every later run.  Mid-session inversions are fixed automatically by \
+         the detector asking the renderer to swap which eye gets which image (glass timing \
+         untouched).  NVSTUSB_STAMP_DIAG=1 prints per-swap stamp diagnostics."
+    );
 
     // --- Wake socket -------------------------------------------------------
     let wake_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
@@ -1161,6 +1784,47 @@ pub fn run() {
     // fallback.  The edge is handled in the loop: a mode switch prunes the
     // queue that belongs to the other mode so a stale eye can never mix in.
     let mut stamped_mode = false;
+
+    // --- Automatic inversion detection (phase-pinned mode) ------------------
+    // The display alternates which eye it shows one frame per vblank boundary;
+    // the shutter glasses lock to whatever alternating phase the host fired at
+    // lock-in and KEEP that phase for the session.  The host fires exactly what
+    // the DLL reports, so the fired↔display pairing is correct as long as the
+    // two stay phase-locked.  But a discrete phase event -- a re-anchor after a
+    // dip/freerun, a submit→scanout offset change, or a game that starts with a
+    // different eye order -- can shift the pairing by one full slot: the same
+    // eye now fires on the opposite boundary parity and the viewer sees
+    // INVERTED depth for the rest of the session.
+    //
+    // Detection: the glasses' locked phase is constant.  The `InversionState`
+    // records the reference eye that fired at its reference boundary once the
+    // session PROVES a stable phase -- it requires `INVERSION_REF_STABLE_FIRES`
+    // consistent same-parity real fires (skipping the startup re-anchor/freerun
+    // thrash) before locking, so the reference reflects the glasses' true
+    // locked phase, not an arbitrary early fire.  At any later same-parity
+    // boundary, if the host fires a DIFFERENT eye, the pairing has shifted a
+    // slot: set (or clear) FLAG_INVERT_EYES so the renderer swaps which eye it
+    // renders.  The glasses' shutter timing is NEVER adjusted -- only the shm
+    // flag is toggled, so there is no phase shift on the glasses side and no
+    // uncomfortable dark/black period (the old approach re-pinned the schedule
+    // by +/- one period, which held one eye for the extra slot -- visibly
+    // uncomfortable).  Once the DLL swaps, the fired eye returns to the
+    // reference and the detector goes quiet (self-correcting, no oscillation).
+    //
+    // Only real DLL eyes (not freerun toggles) are compared: a freerun invents
+    // an arbitrary eye that carries no phase information.  Only stamped
+    // (phase-pinned) mode runs the detector -- legacy (v1) mode has no grid and
+    // keeps the manual button (manual_invert).  A manual button press clears
+    // the reference so the detector can never undo the user's own correction.
+    //
+    // After a re-anchor (monitor switch, resync), the display's eye phase is
+    // unchanged -- only the vblank clock phase shifts -- so the inversion flag
+    // persists.  The reference boundary is re-established on the new monitor's
+    // grid via the next real DLL eye.
+
+    // Reference for automatic inversion detection: the boundary + fired eye
+    // that defined the glasses' locked phase.  See `InversionState`.
+    let mut inversion = InversionState::default();
     // Previous read of the emitter's 3D button, so the toggle is EDGE-triggered
     // on a 0->1 transition rather than level-triggered.  Level-triggering could
     // latch a spurious/garbage high bit (or a stuck button) into a PERMANENT
@@ -1200,6 +1864,15 @@ pub fn run() {
     // that stops must not let the NEXT launch inherit a stale, possibly
     // wrong-held eye (which would latch the new stream inverted).
     let mut was_alive = false;
+    // Set when content RESUMES after a dead stretch.  The DRM prediction
+    // (`next_present_us`) freezes while the host is idle (`frame_start`/
+    // `frame_end` are gated on the schedule having an eye), so on resume it can
+    // carry a stale phase relative to the display grid -- and `frame_start`
+    // only ever moves it in WHOLE periods, so that stale phase survives every
+    // snap.  Re-anchor it onto the next kernel-confirmed vblank's grid before
+    // the first armed frame (see the acquisition-storm docs) so acquisition
+    // cannot start half a period off the display grid.
+    let mut force_grid_resync = false;
 
     // Burst visibility: how many drains carried >=2 swaps (multiple presents
     // landed since the previous drain -- coalescing/burst signature), and the
@@ -1216,6 +1889,13 @@ pub fn run() {
     let mut lead_sum: u64 = 0;
     let mut lead_min: u64 = 0;
     let mut lead_max: u64 = 0;
+
+    // Instant of the most recent `send_eye`, used by the LOCK_MIN_FIRE_GAP_US
+    // backstop to guarantee the inter-packet cadence never collapses below the
+    // emitter's master-lock window (which would make the glasses "will NOT
+    // lock").  Reset to None after each report so a long idle span (no swaps)
+    // doesn't count as a huge gap and then mis-flag the next real fire.
+    let mut last_fire: Option<std::time::Instant> = None;
 
     // Host-epoch of the most recent vblank we waited on (for the lead calc).
     let mut last_vblank_epoch: Option<u64> = None;
@@ -1270,6 +1950,7 @@ pub fn run() {
                 pending.clear_scheduled();
             }
             stamped_mode = mode;
+            eprintln!("nvstusb-host: DIAG t={} stamped_mode -> {}", diag_ts(), mode);
             eprintln!(
                 "nvstusb-host: shared ring is {}",
                 if mode {
@@ -1278,6 +1959,13 @@ pub fn run() {
                     "legacy (version-1 unstamped swaps; FIFO+hold fallback)"
                 }
             );
+            // Pinning is ALWAYS FIFO onto the anchored grid: the validated
+            // silent path for the clean shutter/phase.  Start-phase inversions
+            // are corrected by the automatic detector toggling FLAG_INVERT_EYES
+            // (renderer swaps which eye gets which image -- glass timing
+            // untouched), per the operator's directive to never shift the
+            // shutter/phase to "fix" depth.
+            eprintln!("nvstusb-host: pinning = FIFO (clean shutter/phase; pick which eye renders via the inversion detector)");
         }
 
         // Absorb any new swaps the game pushed.  A fresh swap means the game
@@ -1312,7 +2000,60 @@ pub fn run() {
             } else {
                 None
             };
-            pending.ingest(&swaps, drm_anchor.as_ref(), next_boundary);
+            // Producer-stamp diagnostics (NVSTUSB_STAMP_DIAG=1): compute the
+            // exact FIFO pin sequence ingest will use, BEFORE ingest mutates
+            // the schedule, so each swap can be correlated with the DLL's
+            // submit stamp and the host grid afterwards (see stamp_diag.rs).
+            let stamp_fifo_pins: Vec<Option<u64>> = if crate::stamp_diag::enabled() {
+                if let Some(anchor) = drm_anchor.as_ref() {
+                    let p = anchor.period_us().max(1);
+                    let mut b =
+                        next_boundary.map(|g| floored_next_boundary(pending.tail_boundary(), g, p));
+                    swaps
+                        .iter()
+                        .map(|_| {
+                            let r = b;
+                            if let Some(x) = b.as_mut() {
+                                *x = x.saturating_add(p);
+                            }
+                            r
+                        })
+                        .collect()
+                } else {
+                    vec![None; swaps.len()]
+                }
+            } else {
+                Vec::new()
+            };
+            pending.ingest(
+                &swaps,
+                drm_anchor.as_ref(),
+                drm_anchor.as_ref().map_or(0, |a| a.period_us().max(1)),
+                next_boundary,
+                last_vblank_epoch,
+                if crate::stamp_diag::pin_mode() {
+                    crate::stamp_diag::offset_est()
+                } else {
+                    None
+                },
+            );
+            // Feed the DLL-clock offset estimator (stamp_diag no-ops unless a
+            // stamp mode is active); the median age becomes the correction the
+            // NEXT drain's stamped pins use.
+            if let Some(anchor) = drm_anchor.as_ref() {
+                for s in &swaps {
+                    crate::stamp_diag::record_age_of(anchor, *s);
+                }
+            }
+            if !stamp_fifo_pins.is_empty() {
+                if let Some(anchor) = drm_anchor.as_ref() {
+                    let p = anchor.period_us().max(1);
+                    let ref_vb = last_vblank_epoch.unwrap_or(0);
+                    for (s, fb) in swaps.iter().zip(&stamp_fifo_pins) {
+                        crate::stamp_diag::log_swap(anchor, ref_vb, p, *s, *fb);
+                    }
+                }
+            }
             // Where in the vblank frame this batch of swaps landed: the time
             // remaining to the next vblank is our look-ahead budget.
             if let (Some(anchor), Some(vb)) = (drm_anchor.as_ref(), last_vblank_epoch) {
@@ -1356,6 +2097,12 @@ pub fn run() {
                     // on the new head's confirmed vblanks.
                     last_vblank_epoch = None;
                     pending.reset();
+                    // The DISPLAY's eye phase is unchanged by a re-anchor (the
+                    // monitor keeps alternating L/R at its own cadence), so the
+                    // inversion flag persists.  But the reference boundary was
+                    // on the old head's grid -- re-establish it on the new
+                    // monitor's grid via the next real DLL eye.
+                    inversion.clear();
                     if let Some(a) = drm_anchor.as_mut() {
                         a.force_resync();
                     }
@@ -1409,6 +2156,30 @@ pub fn run() {
             // present establishes a clean anchor.
             if was_alive && !alive {
                 pending.reset();
+                // Fresh stamp-diagnostic detail budget for the next launch /
+                // resume burst (NVSTUSB_STAMP_DIAG=1).
+                crate::stamp_diag::reset();
+                // A game/exe that quits often restarts (or is followed by a
+                // different one) with a FRESH DLL that may report a different
+                // native eye phase than the session that just ended.  The
+                // display's phase is unchanged, but the reference must be
+                // re-established from the next launch's first real DLL eye --
+                // the automatic detector re-compares and confirm/flips
+                // FLAG_INVERT_EYES from there.
+                inversion.clear();
+            }
+            if !was_alive && alive {
+                // Content resumed after an idle stretch: re-anchor the DRM
+                // prediction onto the display grid before the first armed
+                // frame (see `force_grid_resync`'s declaration inside the main
+                // loop).  The dead window froze the prediction with an
+                // arbitrary phase vs. the marching display grid; without the
+                // re-anchor, acquisition starts with the armed target half a
+                // period off the pins and the overdue/re-anchor storm
+                // throttles emission during the very window the glasses are
+                // trying to lock (the pre-lock "will NOT lock" storm the
+                // acquisition docs describe).
+                force_grid_resync = true;
             }
             was_alive = alive;
 
@@ -1447,6 +2218,13 @@ pub fn run() {
                             shm.clear_invert_eyes();
                             eprintln!("nvstusb-host: emitter button -> game restores native L/R eyes");
                         }
+                        // A manual button press is the authoritative polarity
+                        // correction: whatever the glasses now fire becomes the
+                        // correct locked phase.  Re-establish the inversion
+                        // reference from the next real DLL eye so the automatic
+                        // detector compares against the newly-corrected phase
+                        // instead of fighting the user's correction.
+                        inversion.clear();
                     } else {
                         manual_invert = !manual_invert;
                         eprintln!(
@@ -1468,13 +2246,36 @@ pub fn run() {
                         Some(vblank_us) => {
                             let first_grid = last_vblank_epoch.is_none();
                             last_vblank_epoch = Some(vblank_us);
-                            if first_grid && stamped_mode {
-                                // The first confirmed boundary establishes the
-                                // grid; startup swaps that landed before it were
-                                // necessarily FIFO'd -- drop them so the
-                                // stamped schedule (whose targets are
-                                // grid-exact) becomes the only source.
-                                pending.clear_fallback();
+                            if first_grid {
+                                // The FIRST kernel-confirmed vblank establishes
+                                // the armed grid.  The anchor's prediction can
+                                // carry a phase from open()/before content, and
+                                // `frame_start` only advances it in WHOLE
+                                // periods -- so a stale phase survives every
+                                // snap.  Pin the prediction to this confirmed
+                                // vblank's own grid (`vblank + period` = the
+                                // real next slot) so the very first pins and
+                                // arms agree with the display (the
+                                // acquisition-storm root fix).  Applies in
+                                // BOTH modes: even unstamped swaps are pinned
+                                // FIFO onto this grid.
+                                anchor.resync_to_vblank(vblank_us);
+                                if stamped_mode {
+                                    // Startup swaps that landed before this
+                                    // first boundary were necessarily FIFO'd --
+                                    // drop them so the stamped schedule (whose
+                                    // targets are grid-exact) becomes the only
+                                    // source.
+                                    pending.clear_fallback();
+                                }
+                            }
+                            if force_grid_resync {
+                                // Content just resumed after a dead stretch
+                                // (the prediction froze during it): re-anchor
+                                // onto this confirmed vblank's grid before the
+                                // first armed frame, exactly like `first_grid`.
+                                anchor.resync_to_vblank(vblank_us);
+                                force_grid_resync = false;
                             }
                             // Late-ingest pass (count accuracy + accurate slot
                             // pinning): swaps pushed since the top-of-loop
@@ -1490,7 +2291,21 @@ pub fn run() {
                                 swaps_this_window += late.len() as u64;
                                 last_swap = Instant::now();
                                 let next_boundary = vblank_us.saturating_add(anchor.period_us());
-                                pending.ingest(&late, Some(anchor), Some(next_boundary));
+                                pending.ingest(
+                                    &late,
+                                    Some(anchor),
+                                    anchor.period_us().max(1),
+                                    Some(next_boundary),
+                                    Some(vblank_us),
+                                    if crate::stamp_diag::pin_mode() {
+                                        crate::stamp_diag::offset_est()
+                                    } else {
+                                        None
+                                    },
+                                );
+                                for s in &late {
+                                    crate::stamp_diag::record_age_of(anchor, *s);
+                                }
                             }
                             // Pace the fire target with the anchor's OWN
                             // `frame_start`/`frame_end` -- the exact pair the
@@ -1513,14 +2328,22 @@ pub fn run() {
                             // content) and, when it sank a full frame behind,
                             // opening the shutter on the wrong eye.
                             let period = anchor.period_us();
+                            // Snaps + computes the fire deadline.  Called on
+                            // EVERY vblank -- even when the schedule is empty --
+                            // so the prediction keeps marching with the display
+                            // grid across sparse-content stretches instead of
+                            // freezing with a stale phase (the acquisition-storm
+                            // root cause: a frozen `next_present_us` whose
+                            // sub-period phase no longer matches the vblank grid
+                            // survives every `frame_start` snap, so the
+                            // confirmed-grid pins fall just past the armed due
+                            // window and the overdue/re-anchor loop storms right
+                            // when the glasses try to lock).  Returns the proven
+                            // fire Instant (target - alarm - lead); the actual
+                            // send below is skipped when no eye is due.
+                            let fire_at = anchor.frame_start(host_lead_us as u32);
+                            let target = anchor.current_present_us();
                             if pending.has_eye() {
-                                // Snaps + computes the fire deadline; advances
-                                // the anchor's prediction one period and
-                                // phase-locks it (called unconditionally so
-                                // the grid keeps marching even across the
-                                // defensive no-fire below).
-                                let fire_at = anchor.frame_start(host_lead_us as u32);
-                                let target = anchor.current_present_us();
                                 // TEMP DEBUG
                                 {
                                     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1536,7 +2359,42 @@ pub fn run() {
                                     }
                                 }
                                 if let Some(eye) = pending.next_eye(target, period) {
-                                    if let Some(fire_at) = fire_at {
+                                    // Harden the fire cadence against a drift /
+                                    // re-anchor timing collapse.  The
+                                    // `frame_start` deadline is normally ~1 slot
+                                    // ahead, but the overdue-rebaseline path can
+                                    // compress the next deadline inside the
+                                    // emitter's master-lock window (trace:
+                                    // period 6779us -> "will NOT lock").  Hold
+                                    // the packet so two sends can never be
+                                    // closer than LOCK_MIN_FIRE_GAP_US, keeping
+                                    // the cadence inside [7600, 9000]us.  This
+                                    // only ever holds on a pathological shorten
+                                    // (never steady 120 Hz), costing at most a
+                                    // few hundred us of lead on that one packet.
+                                    if let (Some(prev), Some(fire_at)) =
+                                        (last_fire, fire_at)
+                                    {
+                                        let floor = prev
+                                            + std::time::Duration::from_micros(
+                                                LOCK_MIN_FIRE_GAP_US,
+                                            );
+                                        if fire_at < floor {
+                                            if crate::stamp_diag::enabled() {
+                                                eprintln!(
+                                                    "nvstusb-host: DIAG t={} fire-gap backstop: deadline {fire_at:?} within LOCK_MIN_FIRE_GAP_US of previous send; holding to {floor:?} (was a shorten)",
+                                                    diag_ts()
+                                                );
+                                            }
+                                            while Instant::now() < floor {
+                                                std::hint::spin_loop();
+                                            }
+                                        } else {
+                                            while Instant::now() < fire_at {
+                                                std::hint::spin_loop();
+                                            }
+                                        }
+                                    } else if let Some(fire_at) = fire_at {
                                         while Instant::now() < fire_at {
                                             std::hint::spin_loop();
                                         }
@@ -1545,23 +2403,75 @@ pub fn run() {
                                     // (and only matters in fallback mode).
                                     let out = eye != manual_invert;
                                     d.send_eye(out, rate_hz);
+                                    // Capture AFTER the (USB) send so `last_fire`
+                                    // aligns with `dbg.record`'s own Instant ->
+                                    // the backstop gap matches the measured
+                                    // `min_period` rather than understating it by
+                                    // the send duration.
+                                    last_fire = Some(std::time::Instant::now());
                                     dbg.record(out);
+
+                                    // --- Automatic inversion detection ---
+                                    // Only in phase-pinned (stamped) mode: that
+                                    // is the mode where the DLL reads
+                                    // FLAG_INVERT_EYES, and the only mode where
+                                    // the display-phase pairing is trustworthy.
+                                    // Legacy (v1) mode keeps the manual button.
+                                    // Only real DLL eyes (not a freerun's
+                                    // invented toggle) carry phase information
+                                    // we can compare against the reference.
+                                    if stamped_mode && !pending.last_was_freerun {
+                                        // Observe this real fire.  A `true`
+                                        // return means the fired↔display
+                                        // pairing shifted a slot (inverted
+                                        // depth).  Toggle FLAG_INVERT_EYES:
+                                        // the DLL swaps which eye it renders
+                                        // (glass timing untouched), so the
+                                        // fired phase returns to the reference
+                                        // and the view un-inverts.
+                                        if inversion.observe(target, period, out) {
+                                            let new_state = !shm.invert_eyes();
+                                            if new_state {
+                                                shm.set_invert_eyes();
+                                            } else {
+                                                shm.clear_invert_eyes();
+                                            }
+                                            eprintln!(
+                                                "nvstusb-host: DIAG t={} inversion detected: fired {:?} != locked reference {:?} at boundary {} (ref {}); FLAG_INVERT_EYES {}",
+                                                diag_ts(),
+                                                if out { "R" } else { "L" },
+                                                if inversion.ref_phase == Some(true) { "R" } else { "L" },
+                                                target,
+                                                inversion.ref_boundary.unwrap_or(0),
+                                                if new_state { "SET" } else { "CLEARED" }
+                                            );
+                                        }
+                                    }
                                 }
-                                // Advance the anchor's prediction exactly like
-                                // the demo's post-swap `frame_end` (one period
-                                // + sub-slot phase-lock).  Confirm against the
-                                // kernel vblank this wait just returned: the
-                                // armed boundary is exactly one period ahead,
-                                // so the phase-preserving normalization folds
-                                // that -period to ~0 (no spurious nudge) --
-                                // keeping the target pinned to the display
-                                // grid.  Confirming against wall-clock `now`
-                                // (mid-frame, `target - alarm - lead` before
-                                // the boundary) would bake a -3250us error
-                                // into every frame and drag the target
-                                // off-grid.
-                                anchor.frame_end(Some(vblank_us));
                             }
+                            // Advance the anchor's prediction EVERY vblank,
+                            // exactly like the demo's post-swap `frame_end`
+                            // (one period + sub-slot phase-lock) -- including
+                            // empty-schedule frames.  Gating it (and
+                            // `frame_start`) on the schedule having an eye
+                            // froze `next_present_us` during idle/sparse
+                            // stretches; that frozen prediction carries a
+                            // stale phase into content start that survives
+                            // every whole-period snap and ignites the
+                            // acquisition overdue/re-anchor storm (this, and
+                            // the `first_grid`/resume `resync_to_vblank`
+                            // calls above, are the storm's root fix).
+                            // Confirm against the kernel vblank this wait just
+                            // returned: the armed boundary is exactly one
+                            // period ahead, so the phase-preserving
+                            // normalization folds that -period to ~0 (no
+                            // spurious nudge) -- keeping the target pinned to
+                            // the display grid.  Confirming against
+                            // wall-clock `now` (mid-frame, `target - alarm -
+                            // lead` before the boundary) would bake a
+                            // -3250us error into every frame and drag the
+                            // target off-grid.
+                            anchor.frame_end(Some(vblank_us));
                         }
                         None => {
                             // Anchor died: fire immediately to stay live, with
@@ -1810,10 +2720,12 @@ mod tests {
     /// THE freerun-inversion regression: when the game under-presents, the host
     /// FREERUNS invented toggle eyes whose parity is arbitrary relative to the
     /// game's real stream.  Left alone, the resumed stream inherits that parity
-    /// and latches INVERTED ~50/50 (the `freerun=7` eye-swap symptom).  Every
-    /// freerun must therefore flag `pending_reanchor`, and the FIRST fresh,
-    /// real DLL eye must consume it -- re-pinning the held phase to the game's
-    /// true eye (so the resumed stream alternates off it deterministically).
+    /// and latches INVERTED ~50/50 (the `freerun=7` eye-swap symptom).  A
+    /// genuine dip (`freerun_since` >= the resync threshold) must therefore
+    /// flag `pending_reanchor`, and the FIRST fresh, real DLL eye must consume
+    /// it -- re-pinning the held phase to the game's true eye (so the resumed
+    /// stream alternates off it deterministically).  Single-slot blips stay
+    /// below the threshold and must NOT flag (see `short_blip_is_not_a_dip`).
     #[test]
     fn freerun_marks_pending_reanchor_consumed_by_next_real_eye() {
         let p = 8_333u64;
@@ -1824,19 +2736,23 @@ mod tests {
         assert_eq!(q.next_eye(b, p), Some(false));
         assert!(!q.pending_reanchor);
 
-        // The game skips a slot: the host freeruns an invented eye, which
-        // breaks its trust in the held parity.
-        q.next_eye(b + p, p);
+        // A genuine dip: the game skips enough slots that the host invents
+        // several freerun eyes, crossing the resync threshold.  That breaks
+        // its trust in the held parity and MUST flag a re-anchor.
+        assert_eq!(q.next_eye(b + p, p), Some(true)); // freerun -> R
+        assert_eq!(q.freerun_since, 1);
+        assert_eq!(q.next_eye(b + 2 * p, p), Some(false)); // freerun -> L
+        assert_eq!(q.freerun_since, 2);
         assert_eq!(
             q.pending_reanchor, true,
-            "a freerun must flag the phase as needing re-anchor"
+            "a genuine dip (freerun_since >= threshold) must flag the phase as needing re-anchor"
         );
 
         // The game resumes with a fresh real eye.  It consumes the flag and
         // re-pins the held phase to the game's own eye -- NOT the freerun's
         // invented parity -- so post-dip parity is deterministic.
         assert!(q.pending_reanchor, "flag still pending before the fresh eye");
-        q.enqueue(true, Some(b + 2 * p), p); // fresh real R
+        q.enqueue(true, Some(b + 3 * p), p); // fresh real R
         assert_eq!(
             q.pending_reanchor, false,
             "the first fresh real eye consumes the pending re-anchor"
@@ -2081,6 +2997,61 @@ mod tests {
         assert_eq!(q.next_eye_present_driven(), Some(true));
     }
 
+    /// The launch-phase coin flip: before the game's FIRST real DLL eye fires,
+    /// the schedule is fed only by startup backlog whose parity is arbitrary
+    /// relative to the game's alternation, and the freerun path would invent
+    /// toggle eyes the glasses lock to (a per-session 50/50 "inverted at
+    /// launch" -- the automatic detector is blind to it because it locks the
+    /// wrong phase as its own reference).  The host must stay SILENT on those
+    /// slots so the FIRST IR pulse is the game's first real eye -- making the
+    /// glasses' lock phase a deterministic function of the game, not startup
+    /// timing.
+    #[test]
+    fn startup_stays_silent_until_first_real_eye() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut q = EyeQueue::default();
+        // A held phase exists (set by the backlog re-anchor) but no real DLL
+        // eye has ever fired -- the exact state that produced trace.log's
+        // `freerun=36` at launch.
+        q.last_fired = Some(true);
+        assert!(!q.first_dll_eye_fired);
+        let _ = q.fallback.len(); // keep fallback empty too
+        // Scheduled and fallback both empty + no real eye yet: SILENT, never
+        // an invented toggle pulse, and no stall/partial stats accumulate.
+        assert_eq!(q.next_eye(b, p), None, "pre-first-eye dip must not freerun");
+        assert_eq!(q.next_eye(b + p, p), None, "pre-first-eye dip must not freerun");
+        assert_eq!(q.drops.freerun, 0, "no invented eyes before the first real one");
+        assert_eq!(q.freerun_since, 0);
+        assert!(!q.pending_reanchor, "silence is not a dip, so no re-anchor flag");
+        // The game's first real eye fires on its own boundary and enables
+        // normal dip-freerun afterwards.
+        q.enqueue(true, Some(b + 2 * p), p);
+        assert_eq!(q.next_eye(b + 2 * p, p), Some(true));
+        assert!(q.first_dll_eye_fired, "first real eye flips the launch latch");
+        assert_eq!(q.next_eye(b + 3 * p, p), Some(false), "dip freerun resumes after a real fire");
+        assert_eq!(q.drops.freerun, 1);
+    }
+
+    /// Same guarantee on the degraded (no-anchor) present-driven path: never
+    /// repeat a held/invented phase before the first real DLL eye.
+    #[test]
+    fn startup_present_driven_stays_silent_until_first_real_eye() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut q = EyeQueue::default();
+        q.last_fired = Some(false); // arbitrary held parity, nothing real fired
+        assert!(!q.first_dll_eye_fired);
+        assert_eq!(q.next_eye_present_driven(), None);
+        assert_eq!(q.next_eye_present_driven(), None);
+        // A real FIFO backlog eye pops (real DLL eye) and the held repeat
+        // resumes only after that.
+        q.enqueue(false, None, p);
+        assert_eq!(q.next_eye_present_driven(), Some(false));
+        assert!(q.first_dll_eye_fired);
+        assert_eq!(q.next_eye_present_driven(), Some(false), "held eye repeats after launch");
+    }
+
     /// The phase_slots button: re-pinning the schedule by +/- one period moves
     /// every pinned eye by exactly one slot and keeps their order.
     #[test]
@@ -2125,10 +3096,10 @@ mod tests {
         let p = 8_333u64;
         let mut q = EyeQueue::default();
         // No anchor/grid: even a stamped swap cannot be pinned -> FIFO fallback.
-        q.ingest(&[crate::shm::Swap { eye: EYE_LEFT, t_us: Some(105_000) }], None, None);
+        q.ingest(&[crate::shm::Swap { eye: EYE_LEFT, t_us: Some(105_000), seq: 1 }], None, p, None, None, None);
         assert_eq!(q.next_eye(b, p), Some(false)); // left
         // Legacy drain (t_us None) -> FIFO.
-        q.ingest(&[crate::shm::Swap { eye: EYE_RIGHT, t_us: None }], None, Some(b));
+        q.ingest(&[crate::shm::Swap { eye: EYE_RIGHT, t_us: None, seq: 2 }], None, p, Some(b), None, None);
         assert_eq!(q.next_eye(b + p, p), Some(true));
     }
 
@@ -2279,8 +3250,8 @@ mod tests {
         // queue depth): under the old t_us-based scheme this pinned to
         // confirmed - 13p and was dropped overdue.  FIFO pinning must ignore
         // t_us entirely and pin it to the next boundary (B1).
-        let stale = crate::shm::Swap { eye: EYE_RIGHT, t_us: Some(confirmed - 13 * p) };
-        q.ingest(&[stale], None, Some(armed));
+        let stale = crate::shm::Swap { eye: EYE_RIGHT, t_us: Some(confirmed - 13 * p), seq: 3 };
+        q.ingest(&[stale], None, p, Some(armed), None, None);
         assert_eq!(q.drops.overdue, 0, "no overdue drop at ingest");
         assert_eq!(
             q.next_eye(armed, p),
@@ -2300,6 +3271,92 @@ mod tests {
         assert_eq!(q2.next_eye(armed, p), Some(false), "L on B1");
         assert_eq!(q2.next_eye(armed + p, p), Some(true), "R on B2");
         assert_eq!(q2.drops.overdue, 0, "no overdue drops");
+    }
+
+    /// Stamped pinning (NVSTUSB_STAMP_PIN=1): with a grid origin and a
+    /// measured DLL-clock offset, a version-2 swap pins to the boundary the
+    /// ARMED grid serves its scanout on -- `boundary_after` (the slot the
+    /// present blocks to) PLUS one period, never the caller's FIFO guess.
+    /// (In this anchor-free test the `stamp_offset` IS the host-epoch-converted
+    /// present time; in production it is `naive + stamp_diag::offset_est()`.)
+    #[test]
+    fn ingest_stamped_pin_wins_over_the_fifo_guess() {
+        let p = 8_333u64;
+        let ref_vb = 1_000_000u64;
+        let mut q = EyeQueue::default();
+        // Converted present = 1_004_000 (mid-period of B0): blocks to B1
+        // (1_008_333), so the armed grid serves the swap on B2 (1_016_666 =
+        // boundary_after + period) -- the same slot FIFO pinning lands on in
+        // the healthy stream.
+        let swap = crate::shm::Swap { eye: EYE_LEFT, t_us: Some(123), seq: 1 };
+        // The caller's FIFO guess points at B1 -- a stale/behind frontier --
+        // and the stamped pin must override it (it is one slot ahead, B2).
+        q.ingest(&[swap], None, p, Some(1_008_333), Some(ref_vb), Some(1_004_000));
+        assert_eq!(
+            q.front_boundary(),
+            Some(1_016_666),
+            "the eye sits on the armed-served boundary (boundary_after + period)"
+        );
+        assert_eq!(q.drops.overdue, 0, "not dropped at ingest");
+        assert_eq!(
+            q.next_eye(1_016_666, p),
+            Some(false),
+            "fires DUE exactly when the armed grid reaches its boundary"
+        );
+        assert_eq!(q.drops.overdue, 0, "nothing dropped");
+    }
+
+    /// Stamped pinning pins a TRULY past slot where it is (never replays it on
+    /// the tail); the eye has already scanned out, so `next_eye`'s overdue
+    /// logic drops it instead -- the documented self-healing contract of the
+    /// signed `boundary_after` mapping.
+    #[test]
+    fn ingest_stamped_keeps_a_true_past_slot_and_lets_it_drop_overdue() {
+        let p = 8_333u64;
+        let ref_vb = 1_000_000u64;
+        let mut q = EyeQueue::default();
+        // Converted present = 983_333 (two periods before the origin): the
+        // present blocks to 983_334, so the armed grid would serve it at
+        // 991_667 (= boundary_after + period) -- still long past, NOT bumped
+        // forward onto the tail.
+        let swap = crate::shm::Swap { eye: EYE_RIGHT, t_us: Some(1), seq: 1 };
+        q.ingest(&[swap], None, p, Some(1_016_666), Some(ref_vb), Some(983_333));
+        assert_eq!(
+            q.front_boundary(),
+            Some(991_667),
+            "must keep the true (already-scanned) slot"
+        );
+        assert_eq!(q.drops.overdue, 0, "not dropped at ingest -- it is still pending");
+        // When the armed grid passes it, the stale eye drops overdue...
+        q.next_eye(1_016_666, p);
+        assert!(q.drops.overdue >= 1, "a past slot must drop, never replay");
+    }
+
+    /// Two eyes of one 60fps frame submit back-to-back before the shared
+    /// vblank; both stamps resolve to the SAME armed-served slot.  `enqueue`'s
+    /// live-schedule collision walk re-spaces the second onto the following
+    /// slot, so the pair still fires as a correct L/R alternation -- same
+    /// behaviour as FIFO mode, now with the absolute slot from the stamps.
+    #[test]
+    fn ingest_stamped_pair_respaces_to_consecutive_slots() {
+        let p = 8_333u64;
+        let ref_vb = 1_000_000u64;
+        let mut q = EyeQueue::default();
+        let pair = [
+            crate::shm::Swap { eye: EYE_LEFT, t_us: Some(1), seq: 1 },
+            crate::shm::Swap { eye: EYE_RIGHT, t_us: Some(2), seq: 2 },
+        ];
+        // Both convert to 1_004_000 -> both block to B1 -> both would pin to
+        // B2 (boundary_after + period); enqueue bumps R onto B3.
+        q.ingest(&pair, None, p, None, Some(ref_vb), Some(1_004_000));
+        assert_eq!(
+            q.scheduled.iter().map(|&(b, _)| b).collect::<Vec<_>>(),
+            vec![1_016_666, 1_024_999],
+            "L keeps B2, R is re-spaced onto B3"
+        );
+        assert_eq!(q.next_eye(1_016_666, p), Some(false), "L on B2");
+        assert_eq!(q.next_eye(1_024_999, p), Some(true), "R on B3");
+        assert_eq!(q.drops.overdue, 0, "nothing dropped");
     }
 
     /// THE genuine-60fps-still-thrashing regression: `ingest`'s caller-supplied
@@ -2370,5 +3427,714 @@ mod tests {
         );
         assert_eq!(q.drops.coalesced, 0);
         assert_eq!(q.drops.overdue, 0);
+    }
+
+    // --- Automatic inversion detection (InversionState) --------------------
+
+    /// Drives `slots` consecutive display slots of a STABLE alternating stream
+    /// starting at boundary `b`: even slots (same parity as `b`) fire `r` on
+    /// the even parity and `!r` on the odd parity -- i.e. a consistent
+    /// alternation whose even-parity eye is `r`.  Returns the last observe()
+    /// result (used to check for spurious flags while stabilizing).
+    fn drive_stable(inv: &mut InversionState, b: u64, p: u64, r: bool, slots: u32) -> bool {
+        let mut last = false;
+        for i in 0..slots {
+            let even = i % 2 == 0;
+            let fired = if even { r } else { !r };
+            last = inv.observe(b + i as u64 * p, p, fired);
+        }
+        last
+    }
+
+    /// The reference locks only after INVERSION_REF_STABLE_FIRES consistent
+    /// same-parity real fires -- NOT on the arbitrary first fire (which can
+    /// land during the startup re-anchor/freerun thrash and blind the detector
+    /// to later phase flips).
+    #[test]
+    fn inversion_state_reference_locks_after_stable_run() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        // Stabilizing (less than the threshold of consistent even-parity R
+        // fires) does NOT lock and never toggles.
+        assert!(!drive_stable(&mut inv, b, p, true, 2 * (INVERSION_REF_STABLE_FIRES - 1)));
+        assert_eq!(inv.ref_boundary, None, "reference must not lock prematurely");
+        assert_eq!(inv.cand_phase, Some(true), "candidate tracks even-parity R");
+        // Crossing the threshold promotes the proven candidate to the locked
+        // reference (the even-parity R eye at the first candidate boundary).
+        assert!(!drive_stable(&mut inv, b, p, true, 2));
+        assert_eq!(inv.ref_boundary, Some(b));
+        assert_eq!(inv.ref_phase, Some(true));
+        assert_eq!(inv.cand_boundary, None, "candidate consumed by the lock");
+    }
+
+    /// A stable session never toggles: same-parity fires keep matching the
+    /// reference, and the opposite eye at the other parity is normal
+    /// alternation (never a false positive).
+    #[test]
+    fn inversion_state_stable_session_never_toggles() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES); // lock R at even parity
+        // Keep firing the same stable alternation: no flags.
+        assert!(!drive_stable(&mut inv, b, p, true, 40));
+        assert_eq!(inv.ref_phase, Some(true));
+    }
+
+    /// A one-slot phase shift (re-anchor re-lot, DLL phase flip, submit→scanout
+    /// offset change) makes same-parity boundaries fire the OPPOSITE eye -- the
+    /// detector must flag it so FLAG_INVERT_EYES is toggled.
+    #[test]
+    fn inversion_state_detects_a_slot_shift() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES); // lock R at even parity
+        // Phase shifts one slot: even boundaries now fire L (was R).
+        assert!(
+            inv.observe(b + 2 * p, p, false),
+            "same-parity fire of the opposite eye must flag inversion"
+        );
+        // The OTHER parity (odd) firing L is still just alternation of the
+        // shifted phase -- not relevant to the reference parity.
+        assert!(!inv.observe(b + p, p, true));
+    }
+
+    /// After `clear()` (manual button / re-anchor / game restart) the next real
+    /// fires re-establish the reference -- a fresh lock-in, no stale memory.
+    #[test]
+    fn inversion_state_clear_reestablishes_reference() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES);
+        assert_eq!(inv.ref_phase, Some(true));
+        inv.clear();
+        assert_eq!(inv.ref_boundary, None);
+        assert_eq!(inv.ref_phase, None);
+        // Next stable run re-locks to whatever the glasses now show (L on the
+        // even-relative-to-b3 parity this time).
+        drive_stable(&mut inv, b + 3 * p, p, false, 2 * INVERSION_REF_STABLE_FIRES);
+        assert_eq!(inv.ref_phase, Some(false));
+        // Stable again: the SAME parity class as the new reference (b+5p, same
+        // class as b+3p) fires L and matches -> quiet; the OPPOSITE parity
+        // (b+6p) fires R -> normal alternation, quiet.
+        assert!(!inv.observe(b + 5 * p, p, false));
+        assert!(!inv.observe(b + 6 * p, p, true));
+    }
+
+    /// The full self-correcting cycle: a shift is flagged once, and once the
+    /// renderer swaps (via FLAG_INVERT_EYES) the fired phase returns to the
+    /// reference so the detector goes quiet -- no oscillation.
+    #[test]
+    fn inversion_state_self_corrects_without_oscillation() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES); // lock R at even parity
+
+        // A slot shift: even boundaries fire L.  Flagged.
+        assert!(inv.observe(b + 2 * p, p, false));
+
+        // The renderer swaps; even boundaries fire R again (the swapped DLL
+        // phase returns the fired eye to the reference).  Quiet.
+        assert!(!inv.observe(b + 4 * p, p, true));
+        assert!(!inv.observe(b + 6 * p, p, true));
+        // Opposite parity is unchanged alternation.
+        assert!(!inv.observe(b + p, p, false));
+        assert!(!inv.observe(b + 3 * p, p, false));
+    }
+
+    /// The detector is purely phase-relative: different reference boundaries
+    /// (odd vs even lock-in) behave symmetrically.
+    #[test]
+    fn inversion_state_symmetric_for_odd_lockin() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        // Lock-in at an ODD-parity reference boundary (b+p fires L there):
+        // odd slots fire L, even slots fire R.
+        let b0 = b + p;
+        for i in 0..(2 * INVERSION_REF_STABLE_FIRES) {
+            let even = i % 2 == 0;
+            // At i=0 (slot b0, odd parity): L. At i=1 (b0+p = even): R.
+            let fired = if even { false } else { true };
+            inv.observe(b0 + i as u64 * p, p, fired);
+        }
+        assert_eq!(inv.ref_phase, Some(false), "odd-parity lock-in is L");
+        // A shift to R at odd parity flags.
+        assert!(inv.observe(b0 + 2 * p, p, true), "odd-parity shift detected");
+        // Even boundaries firing R is normal alternation of the shifted phase.
+        assert!(!inv.observe(b0 + p, p, false));
+    }
+
+    /// THE startup-thrash regression (trace.log): the opening seconds contain
+    /// several re-anchors/freeruns and the FIFO polarity is still a coin-flip,
+    /// so the OLD "first real fire locks the reference" design locked a slot-off
+    /// phase and went permanently blind -- later same-parity fires "matched",
+    /// and a genuine end-of-session flip read as `invert=0, no detection`.  The
+    /// candidate accumulator must NOT lock while the even-parity eye oscillates;
+    /// it locks only on the proven, stable phase -- which stays locked long
+    /// enough to catch a real flip later (the user's "correct then flipped").
+    #[test]
+    fn inversion_state_does_not_lock_during_startup_thrash() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        // Startup thrash: even parity fires R,L,R,L,R,L... (the phase keeps
+        // flipping as re-anchors re-commit).  The candidate must keep
+        // resetting and never lock.
+        for i in 0..(2 * INVERSION_REF_STABLE_FIRES) {
+            let even = i % 2 == 0;
+            let fired = if even { i % 4 < 2 } else { !(i % 4 < 2) };
+            inv.observe(b + i as u64 * p, p, fired);
+        }
+        assert_eq!(
+            inv.ref_boundary, None,
+            "thrashing phase must never lock a reference"
+        );
+        // Session settles: even parity consistently R.  The accumulator now
+        // builds a stable candidate and locks once proven.
+        assert!(!drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES));
+        assert_eq!(inv.ref_boundary, Some(b));
+        assert_eq!(inv.ref_phase, Some(true));
+        // And once locked, a genuine late flip (the end-of-session re-anchor)
+        // IS caught -- even boundaries firing L now flags it.
+        assert!(
+            inv.observe(b + 2 * p, p, false),
+            "after stabilization the detector must catch a real late flip"
+        );
+        assert!(
+            inv.observe(b + 4 * p, p, false),
+            "still locked and still flagging until the renderer swaps"
+        );
+    }
+
+    /// The user's exact scenario: a stable correct session (reference locks on
+    /// the proven correct phase), then the end-of-session drift re-anchor
+    /// commits the WRONG eye.  The very next same-parity real fire must flag it
+    /// (this is what the old first-fire lock missed).
+    #[test]
+    fn inversion_state_detects_end_of_session_reanchor_flip() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut inv = InversionState::default();
+        // Correct session: even parity fires R, stable, long enough to lock.
+        drive_stable(&mut inv, b, p, true, 2 * INVERSION_REF_STABLE_FIRES + 40);
+        assert_eq!(inv.ref_phase, Some(true), "correct phase locked");
+
+        // Drift accumulates; at the overdue re-anchor the recovery commits the
+        // WRONG eye: even boundaries now fire L (the flip the user saw).
+        assert!(
+            inv.observe(b + 2 * p, p, false),
+            "the flip must be detected on the first same-parity real fire"
+        );
+        // The renderer swaps (FLAG_INVERT_EYES); even boundaries return to R.
+        assert!(!inv.observe(b + 4 * p, p, true), "self-corrected, quiet");
+        // Odd parity stays normal alternation.
+        assert!(!inv.observe(b + p, p, false));
+        assert!(!inv.observe(b + 3 * p, p, false));
+    }
+
+    // ------------------------------------------------------------------
+    // Drift re-sync (DRIFT_LAG_ALIGN_PERIOD_DIV): the FIFO pin chain's tiny
+    // systematic period error accumulates over a session, so the front slips
+    // progressively behind the armed grid (trace.log `gap_from_armed` grows to
+    // ~half a period before the overdue re-anchor).  `next_eye` now re-baselines
+    // EARLY -- at ~period/8 lag -- so the shift is small and pairing-preserving,
+    // the shutter never opens off-slot, and the overdue half-period (polarity-
+    // ambiguous) overhaul never fires on a healthy stream.
+    // ------------------------------------------------------------------
+
+    /// A schedule whose front lags the armed boundary by just over period/8
+    /// (but far below half a period) must be re-synced onto the grid by the
+    /// early path: the front eye fires at the armed boundary, NO overdue drop
+    /// happens, NO `pending_reanchor` is set, and the next front stays aligned
+    /// to the following armed boundary (drift bounded).
+    #[test]
+    fn drift_resync_keeps_front_bounded_before_overdue() {
+        let p = 8_333u64;
+        let boundary = 100_000u64;
+        let mut q = EyeQueue::default();
+        // Drifted schedule: front just over period/8 behind the armed boundary
+        // (the early-sync trigger), the rest of the schedule one period apart
+        // behind it.  Well under half a period so the overdue path must NOT
+        // run.
+        let lag = p / DRIFT_LAG_ALIGN_PERIOD_DIV + 1; // ~period/8 + 1
+        assert!(lag < p / 2, "test drift must stay below the overdue threshold");
+        q.enqueue(false, Some(boundary - lag), p);
+        q.enqueue(true, Some(boundary - lag + p), p);
+        q.enqueue(false, Some(boundary - lag + 2 * p), p);
+
+        let fired = q.next_eye(boundary, p);
+        assert_eq!(fired, Some(false), "re-synced front eye fires at the armed boundary");
+        assert!(!q.pending_reanchor, "early re-sync must not set pending_reanchor");
+        assert_eq!(
+            q.drops.overdue, 0,
+            "early re-sync must not trigger the overdue drop path"
+        );
+        // The schedule is back on the grid: the next front sits within
+        // period/8 of the next armed boundary (the drift stays bounded instead
+        // of climbing toward the half-period ambiguity).
+        let next_front = q.front_boundary().unwrap_or(boundary + p);
+        let lag_limit = p / DRIFT_LAG_ALIGN_PERIOD_DIV;
+        assert!(
+            next_front + lag_limit >= boundary + p,
+            "front {next_front} must sit within period/8 of the next armed boundary {}",
+            boundary + p
+        );
+    }
+
+    /// Re-syncing a drifted schedule must preserve the eye->slot pairing: the
+    /// SAME eyes fire at the SAME boundaries as an identical on-grid schedule,
+    /// so a corrected session keeps the exact left/right depth it had before
+    /// the drift accumulated (no polarity flip from the correction).
+    #[test]
+    fn drift_resync_preserves_eye_slot_pairing() {
+        let p = 8_333u64;
+        let boundary = 100_000u64;
+        let build = |q: &mut EyeQueue, off: u64| {
+            q.enqueue(false, Some(boundary - off), p);
+            q.enqueue(true, Some(boundary - off + p), p);
+            q.enqueue(false, Some(boundary - off + 2 * p), p);
+        };
+        // On-grid schedule drives a clean L, R, L sequence.
+        let mut clean = EyeQueue::default();
+        build(&mut clean, 0);
+        let mut clean_fired = Vec::new();
+        for i in 0..3u64 {
+            clean_fired.push(clean.next_eye(boundary + i * p, p));
+        }
+        assert_eq!(clean_fired, vec![Some(false), Some(true), Some(false)]);
+        // The SAME schedule drifted by just over period/8 (the accumulated pin
+        // error) drives to the identical eye sequence once the early re-sync
+        // realigns each slot.
+        let mut drifted = EyeQueue::default();
+        build(&mut drifted, p / DRIFT_LAG_ALIGN_PERIOD_DIV + 1);
+        let mut drifted_fired = Vec::new();
+        for i in 0..3u64 {
+            drifted_fired.push(drifted.next_eye(boundary + i * p, p));
+        }
+        assert_eq!(
+            drifted_fired, clean_fired,
+            "drift re-sync must preserve the eye->slot pairing exactly"
+        );
+    }
+
+    /// A lag just inside the early-sync threshold (below period/8) does NOT
+    /// re-sync (no churn on every fire): the healthy one-slot-ahead front stays
+    /// put and fires normally.
+    #[test]
+    fn drift_resync_does_not_churn_on_small_lag() {
+        let p = 8_333u64;
+        let boundary = 100_000u64;
+        let mut q = EyeQueue::default();
+        // Healthy front exactly on the armed boundary (the normal steady-state
+        // position) -- must fire without any re-baseline.
+        q.enqueue(false, Some(boundary), p);
+        q.enqueue(true, Some(boundary + p), p);
+        let fired = q.next_eye(boundary, p);
+        assert_eq!(fired, Some(false));
+        // A subtle sub-threshold lag (a few us) must also not churn.
+        let mut q = EyeQueue::default();
+        q.enqueue(false, Some(boundary - 5), p);
+        q.enqueue(true, Some(boundary - 5 + p), p);
+        let fired = q.next_eye(boundary, p);
+        assert_eq!(fired, Some(false));
+        assert_eq!(
+            q.front_boundary(),
+            Some(boundary + p - 5),
+            "sub-threshold lag leaves the schedule exactly where it is"
+        );
+    }
+
+    /// trace.log's end-of-session failure was a CONTENT STALL, not drift: the
+    /// display kept vblanking while the game paused, so the armed grid jumped
+    /// whole slots ahead of a schedule that was still ON the display grid
+    /// (`front=95159619, gap=2` right before `boundary=95176288`).  The old
+    /// overdue path treated that as drift -- dropped the eye, re-baselined,
+    /// flagged a re-anchor -- and the recovery shifted the stream ~1 slot off
+    /// (`gap_from_armed -3260us`, fire-gap churn, "will NOT lock"), which
+    /// latched the inversion the user saw.  An on-grid stall must be DROP-ONLY:
+    /// the scanned-out eyes go, the survivors keep their ORIGINAL grid pins
+    /// (the display grid never moved), and no re-anchor is flagged.
+    #[test]
+    fn stall_overdue_drops_passed_eye_without_rebaseline_or_reanchor() {
+        let p = 8_333u64;
+        let b = 100_000u64;
+        let mut q = EyeQueue::default();
+        // On-grid FIFO schedule: every eye sits on a real vblank multiple.
+        q.enqueue(true, Some(b), p); // R
+        q.enqueue(false, Some(b + p), p); // L
+        q.enqueue(true, Some(b + 2 * p), p); // R
+        q.enqueue(false, Some(b + 3 * p), p); // L
+
+        assert_eq!(q.next_eye(b, p), Some(true), "R fires on b");
+        assert!(!q.pending_reanchor);
+
+        // Stall: the armed grid advances one whole slot with no present (slot
+        // b+p scanned out).  The passed eye is dropped; the schedule is still
+        // on the grid, so no shift and no re-anchor flag.
+        assert_eq!(
+            q.next_eye(b + 2 * p, p),
+            Some(true),
+            "grid-aligned R fires on b+2p"
+        );
+        assert_eq!(q.drops.overdue, 1, "only the passed slot is dropped");
+        assert!(
+            !q.pending_reanchor,
+            "an on-grid stall must not flag a re-anchor (phase is authoritative)"
+        );
+        assert_eq!(
+            q.front_boundary(),
+            Some(b + 3 * p),
+            "the survivor keeps its ORIGINAL on-grid pin; no whole-stream shift"
+        );
+        assert_eq!(
+            q.next_eye(b + 3 * p, p),
+            Some(false),
+            "L fires on b+3p: the eye->slot pairing is exactly the pre-stall grid"
+        );
+    }
+
+    /// The mirror of the drift re-sync: a recovery path (or a boundary that
+    /// snapped back) can leave the front pinned MORE than period/8 AHEAD of the
+    /// armed grid (the trace.log -3260us post-stall transient).  Firing it
+    /// early opens the shutter onto the previous slot -> wrong image.  The same
+    /// early path must pull it back onto the armed grid: small, pairing-
+    /// preserving, no re-anchor flag.
+    #[test]
+    fn drift_resync_pulls_front_back_when_leading() {
+        let p = 8_333u64;
+        let boundary = 100_000u64;
+        let mut q = EyeQueue::default();
+        let lead = p / DRIFT_LAG_ALIGN_PERIOD_DIV + 1; // just over period/8 ahead
+        assert!(lead < p / 2, "test lead must stay below the overdue threshold");
+        q.enqueue(true, Some(boundary + lead), p);
+        q.enqueue(false, Some(boundary + lead + p), p);
+        q.enqueue(true, Some(boundary + lead + 2 * p), p);
+
+        let fired = q.next_eye(boundary, p);
+        assert_eq!(
+            fired,
+            Some(true),
+            "the re-based front eye fires at the armed boundary, not its stale lead"
+        );
+        assert!(!q.pending_reanchor, "early re-sync must not set pending_reanchor");
+        assert_eq!(q.drops.overdue, 0, "early re-sync must not trigger the overdue path");
+        // The surviving eyes land back on the grid: the next front sits within
+        // period/8 of the next armed boundary.
+        let next_front = q.front_boundary().unwrap_or(boundary + p);
+        let align_limit = p / DRIFT_LAG_ALIGN_PERIOD_DIV;
+        assert!(
+            (next_front as i64 - (boundary + p) as i64).abs() <= align_limit as i64,
+            "front {next_front} must sit within period/8 of the next armed boundary {}",
+            boundary + p
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Re-anchor-storm regression (trace.log): after ONE overdue drop the
+    // schedule's front parked PAST every armed boundary, so no eye was ever
+    // due, every slot freeran (~120/s of ~120 slots), and the
+    // `pending_reanchor` re-anchor kept re-pinning the front forward for ~16
+    // seconds.  The first trace storm sat 2-4 periods ahead (978 re-anchors);
+    // phase 3 of the newest trace sat only ~0.86 period ahead at every drain
+    // (1043 re-anchors) -- inside the old 2-period purge tolerance, which is
+    // exactly why it survived.  `purge_stuck_ahead` now drops any schedule
+    // whose front is beyond the due-window edge (armed + period/2) so the
+    // schedule re-anchors AT the frontier and real eyes fire again.
+    // ------------------------------------------------------------------
+
+    // One boundary of the host main loop's drain/wait/arm cadence at 60fps
+    // content on a 120Hz display: the game pushes one alternating L/R swap per
+    // boundary in the top drain, pinned FIFO onto the anchored grid (ingest's
+    // tail floor) preceded by the stuck-ahead storm guard.  Mirrors main.rs:
+    // `next_boundary = last_vblank + period`; the wait confirms one period;
+    // the arm fires one slot ahead of the just-confirmed vblank.  `stall_hold`
+    // keeps the freerun hold below the test horizon so a sag never darkens.
+    fn drive_stamped_boundary(
+        q: &mut EyeQueue,
+        p: u64,
+        last_vblank: &mut u64,
+        guard: bool,
+    ) -> (u64, Option<bool>) {
+        let guess = last_vblank.saturating_add(p.saturating_mul(2));
+        if guard {
+            q.purge_stuck_ahead(guess, p);
+        }
+        let boundary =
+            floored_next_boundary(q.scheduled.back().map(|&(t, _)| t), guess, p);
+        let eye = (*last_vblank / p) % 2 != 0; // deterministic alternation
+        q.enqueue(eye, Some(boundary), p);
+        let confirmed = *last_vblank + p;
+        *last_vblank = confirmed;
+        let armed = confirmed + p;
+        (armed, q.next_eye(armed, p))
+    }
+
+    // trace.log PHASE-3 cadence, which the per-slot driver above cannot sustain:
+    // a whole [L,R] frame lands in the drain every OTHER vblank (60fps content
+    // on 120Hz), and the intermediate vblank drains NOTHING -- so ingest (and
+    // the stuck-ahead purge) only runs on the drains that carry swaps, exactly
+    // like the live loop's `if !swaps.is_empty()` gate.  The re-anchor then
+    // re-pins the front forward by the same 2 periods per 2 vblanks the armed
+    // frontier advances, keeping the front parked at a CONSTANT ~0.86*period
+    // past the frontier forever (the storm the per-slot cadence drains by
+    // itself).
+    fn drive_phase3_boundary(
+        q: &mut EyeQueue,
+        p: u64,
+        last_vblank: &mut u64,
+        guard: bool,
+        batch: bool,
+    ) -> (u64, Option<bool>) {
+        if batch {
+            let guess = last_vblank.saturating_add(p.saturating_mul(2));
+            if guard {
+                q.purge_stuck_ahead(guess, p);
+            }
+            let boundary = floored_next_boundary(q.scheduled.back().map(|&(t, _)| t), guess, p);
+            let eye = (*last_vblank / p) % 2 != 0; // deterministic L,R frame pair
+            q.enqueue(eye, Some(boundary), p);
+            q.enqueue(!eye, Some(boundary + p), p);
+        }
+        let confirmed = *last_vblank + p;
+        *last_vblank = confirmed;
+        let armed = confirmed + p;
+        (armed, q.next_eye(armed, p))
+    }
+
+    #[test]
+    fn stuck_ahead_guard_drops_only_a_front_beyond_the_due_window() {
+        let p = 8_333u64;
+        let guess = 100_000u64;
+        // A front behind the frontier, or up to the due-window edge
+        // (armed + period/2 -- that exact boundary is still fireable), is a
+        // normal healthy in-flight eye.
+        let mut q = EyeQueue::default();
+        q.enqueue(false, Some(guess - 100), p);
+        q.enqueue(true, Some(guess + p / 2), p);
+        q.purge_stuck_ahead(guess, p);
+        assert_eq!(
+            q.scheduled.len(),
+            2,
+            "healthy schedule (front within the due window) must survive the guard"
+        );
+        // The trace.log PHASE-3 storm state: the re-anchor parks the front
+        // ~0.86*period PAST the frontier at every drain -- far inside the old
+        // 2-period purge tolerance, so the previous guard never fired -- yet
+        // past the due-window edge, so nothing can ever be due and the
+        // re-anchor loop keeps it there.  It must be dropped wholesale so the
+        // next drain re-anchors at the frontier.
+        let mut q = EyeQueue::default();
+        q.enqueue(false, Some(guess + p), p);
+        q.enqueue(true, Some(guess + 2 * p), p);
+        q.purge_stuck_ahead(guess, p);
+        assert!(
+            q.scheduled.is_empty(),
+            "stuck-ahead storm schedule must be purged"
+        );
+        // A front parked FOUR periods past the guess (trace.log's FIRST storm)
+        // is also caught.
+        let mut q = EyeQueue::default();
+        q.enqueue(false, Some(guess + 4 * p), p);
+        q.enqueue(true, Some(guess + 5 * p), p);
+        q.purge_stuck_ahead(guess, p);
+        assert!(q.scheduled.is_empty());
+        // An empty queue is a no-op.
+        let mut q = EyeQueue::default();
+        q.purge_stuck_ahead(guess, p);
+        assert!(q.scheduled.is_empty());
+    }
+
+    #[test]
+    fn stuck_ahead_storm_recovers_to_on_time_real_fires() {
+        let p = 8_333u64;
+        // Seed the trace.log storm state: the failed re-anchor left the front
+        // ~2 periods PAST the first armed boundary (which the re-anchor then
+        // kept pushing to ~4 periods ahead -- the self-sustaining loop).
+        let mut q = EyeQueue::default();
+        let mut last_vblank = 100_000u64;
+        let first_arm = last_vblank + 2 * p;
+        q.enqueue(false, Some(first_arm + 2 * p), p);
+        q.enqueue(true, Some(first_arm + 3 * p), p);
+
+        let mut freeruns = 0u64;
+        let mut reals = 0u64;
+        for _ in 0..200u64 {
+            let (_, fired) = drive_stamped_boundary(&mut q, p, &mut last_vblank, true);
+            if let Some(_f) = fired {
+                if q.last_was_freerun {
+                    freeruns += 1;
+                } else {
+                    reals += 1;
+                }
+            }
+        }
+        assert!(
+            freeruns <= 2,
+            "storm must break within ~1 recovery slot, got {freeruns} freeruns"
+        );
+        assert!(
+            reals >= 195,
+            "the stream must re-anchor and fire real DLL eyes, got {reals} real fires"
+        );
+        assert_eq!(
+            q.freerun_since, 0,
+            "no ongoing freerun once the schedule is on-time"
+        );
+        assert!(
+            !q.pending_reanchor,
+            "no pending re-anchor once the schedule is on-time"
+        );
+        // The schedule drains each boundary: the front tracks the armed grid
+        // (empty, or the next boundary's eye) instead of parking ahead.
+        let arm_after = last_vblank + p;
+        match q.front_boundary() {
+            None => {}
+            Some(f) => assert!(
+                f <= arm_after + p / 2,
+                "front {f} must sit within the due window of armed {arm_after}"
+            ),
+        }
+    }
+
+    #[test]
+    fn stuck_ahead_storm_control_storms_without_the_guard() {
+        // Same seed and cadence WITHOUT the guard: the storm must reproduce
+        // (front ~4p ahead of every arm, one re-anchor per 2 slots, ~no real
+        // fires) -- proving the guard is the mechanism that fixes the storm.
+        let p = 8_333u64;
+        let mut q = EyeQueue::default();
+        let mut last_vblank = 100_000u64;
+        let first_arm = last_vblank + 2 * p;
+        q.enqueue(false, Some(first_arm + 2 * p), p);
+        q.enqueue(true, Some(first_arm + 3 * p), p);
+        // trace.log's storm is a MID-session failure (after an overdue drop),
+        // so a real eye has already fired and startup-silence no longer
+        // applies -- otherwise the pre-first-eye guard drains the queue on its
+        // own and the "without the stuck-ahead guard" storm never forms.
+        q.first_dll_eye_fired = true;
+
+        let mut freeruns = 0u64;
+        let mut reals = 0u64;
+        for _ in 0..200u64 {
+            let (_, fired) = drive_stamped_boundary(&mut q, p, &mut last_vblank, false);
+            if let Some(_f) = fired {
+                if q.last_was_freerun {
+                    freeruns += 1;
+                } else {
+                    reals += 1;
+                }
+            }
+        }
+        assert!(
+            reals <= 10 && freeruns >= 180,
+            "control: without the guard the stream must storm \
+             (reals={reals} freeruns={freeruns})"
+        );
+    }
+
+    #[test]
+    fn healthy_pipeline_never_trips_the_stuck_ahead_guard() {
+        // A steady 60fps stream from a cold start (empty schedule): every slot
+        // fires a real DLL eye and the guard stays dormant -- the front hovers
+        // within roughly one period of the frontier.
+        let p = 8_333u64;
+        let mut q = EyeQueue::default();
+        let mut last_vblank = 100_000u64;
+        let mut freeruns = 0u64;
+        for _ in 0..200u64 {
+            let (_, fired) = drive_stamped_boundary(&mut q, p, &mut last_vblank, true);
+            if let Some(_f) = fired {
+                if q.last_was_freerun {
+                    freeruns += 1;
+                }
+            }
+        }
+        assert_eq!(freeruns, 0, "healthy stream must fire real eyes every slot");
+        assert!(!q.pending_reanchor, "guard must never trip on a healthy stream");
+    }
+
+    #[test]
+    fn stuck_ahead_guard_breaks_phase3_due_window_storm() {
+        // trace.log phase 3: after an overdue re-anchor the front parked
+        // ~0.86*period past the frontier at EVERY drain -- just inside the old
+        // 2-period purge tolerance, so the previous guard never fired and the
+        // session stormed (~1043 freerun re-anchors, ~0 real fires; the stream
+        // stayed inverted and the detector starved).  The due-window-edge guard
+        // must break it: the first drain after the purge re-anchors at the
+        // frontier and every (L,R) frame fires real.
+        let p = 8_333u64;
+        let mut q = EyeQueue::default();
+        let mut last_vblank = 100_000u64;
+        let first_arm = last_vblank + 2 * p;
+        // The phase-3 steady state the failed re-anchor left behind: front just
+        // past the due window, tail one period further, mid freerun/re-anchor.
+        q.enqueue(false, Some(first_arm + (7 * p) / 8), p);
+        q.enqueue(true, Some(first_arm + (7 * p) / 8 + p), p);
+        q.freerun_since = DIP_RESYNC_AFTER_FREERUN_SLOTS;
+        q.pending_reanchor = true;
+
+        let mut freeruns = 0u64;
+        let mut reals = 0u64;
+        for i in 0..400u64 {
+            let (_, fired) = drive_phase3_boundary(&mut q, p, &mut last_vblank, true, i % 2 == 0);
+            if let Some(_f) = fired {
+                if q.last_was_freerun {
+                    freeruns += 1;
+                } else {
+                    reals += 1;
+                }
+            }
+        }
+        assert!(
+            freeruns <= 4,
+            "due-window guard must break the phase-3 storm, got {freeruns} freeruns"
+        );
+        assert!(
+            reals >= 390,
+            "schedule must re-anchor at the frontier and fire real eyes, got {reals}"
+        );
+        assert_eq!(q.freerun_since, 0, "no ongoing freerun after recovery");
+        assert!(!q.pending_reanchor, "no pending re-anchor after recovery");
+    }
+
+    #[test]
+    fn stuck_ahead_guard_phase3_control_storms_without_the_guard() {
+        // Control: the SAME phase-3 seed and cadence WITHOUT the guard
+        // reproduces the trace storm -- ~zero real fires, endless freeruns and
+        // re-anchors -- proving the due-window purge is the mechanism that
+        // breaks it.
+        let p = 8_333u64;
+        let mut q = EyeQueue::default();
+        let mut last_vblank = 100_000u64;
+        let first_arm = last_vblank + 2 * p;
+        q.enqueue(false, Some(first_arm + (7 * p) / 8), p);
+        q.enqueue(true, Some(first_arm + (7 * p) / 8 + p), p);
+        q.freerun_since = DIP_RESYNC_AFTER_FREERUN_SLOTS;
+        q.pending_reanchor = true;
+        // Same mid-session seeding as the other control: phase-3 storms happen
+        // after real eyes have fired, so the startup-silence latch is off.
+        q.first_dll_eye_fired = true;
+
+        let mut freeruns = 0u64;
+        let mut reals = 0u64;
+        for i in 0..400u64 {
+            let (_, fired) = drive_phase3_boundary(&mut q, p, &mut last_vblank, false, i % 2 == 0);
+            if let Some(_f) = fired {
+                if q.last_was_freerun {
+                    freeruns += 1;
+                } else {
+                    reals += 1;
+                }
+            }
+        }
+        assert!(
+            reals <= 10 && freeruns >= 380,
+            "control: without the guard phase 3 must storm (reals={reals} freeruns={freeruns})"
+        );
     }
 }

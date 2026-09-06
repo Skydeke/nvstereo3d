@@ -115,10 +115,14 @@ pub struct RingSlot {
 
 /// One drained eye-swap: the eye plus (version-2 regions) the producer's
 /// CLOCK_MONOTONIC submit timestamp.  `t_us` is `None` on legacy regions.
+/// `seq` is the producer sequence number (used by the stamp diagnostics to
+/// notice producer restarts / backlog gaps); it is 0 on legacy layouts where
+/// the 8-byte slot carries no sequence.
 #[derive(Clone, Copy, Debug)]
 pub struct Swap {
     pub eye: u8,
     pub t_us: Option<u64>,
+    pub seq: u32,
 }
 
 // Pin the wire layout: the stamped slot must be exactly the 16-byte stride and
@@ -414,6 +418,7 @@ impl Shm {
                     Swap {
                         eye: s.eye,
                         t_us: Some(s.t_us),
+                        seq: s.seq,
                     }
                 } else {
                     // Legacy 8-byte slot; the eye byte sits at the same offset
@@ -421,6 +426,7 @@ impl Shm {
                     Swap {
                         eye: *(addr as *const u8).add(4),
                         t_us: None,
+                        seq: 0,
                     }
                 }
             };

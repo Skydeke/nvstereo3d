@@ -1494,6 +1494,39 @@ impl DrmVblank {
     pub fn force_resync(&mut self) {
         self.frames_since_resync = self.resync_every;
     }
+
+    /// Re-anchors the prediction DIRECTLY onto a kernel-confirmed vblank's
+    /// grid: the next present is pinned to `vblank_us + period` (the very next
+    /// real display slot) and a full resync is primed for the following
+    /// `frame_end`.
+    ///
+    /// This is the authoritative grid-ESTABLISHMENT path, used only at clean
+    /// transitions -- the first confirmed vblank of a (re)start, or a content
+    /// resume after the prediction froze during an idle stretch -- where there
+    /// is no live schedule to preserve and the display grid itself is the only
+    /// correct reference.  It must NOT be called mid-stream: jumping the
+    /// prediction a whole slot there would fire an eye a display slot late
+    /// (shutter misses its window -> glasses dark / a flicker per step).
+    ///
+    /// Without this, a frozen `next_present_us` carries a stale sub-period
+    /// phase into content start.  `frame_start`'s snap only ever advances in
+    /// WHOLE periods, so the stale phase survives every snap: the confirmed-
+    /// grid FIFO pins land just past the armed due window and the
+    /// overdue/re-anchor loop storms (trace.log's `pending_reanchor SET
+    /// (overdue)` + `reanchor` pairs) at the exact moment the glasses try to
+    /// lock -- re-introducing the arbitrary-parity first pulse the
+    /// `first_dll_eye_fired` latch was added to prevent.
+    pub fn resync_to_vblank(&mut self, vblank_us: u64) {
+        self.next_present_us = vblank_us.saturating_add(self.period_us.max(1));
+        // Ground the confirmed reference on this same vblank so the next
+        // `frame_end`'s period re-measurement compares like-for-like (the
+        // host-epoch sample is a real boundary, not a stale/zero one).
+        self.confirmed_us = vblank_us;
+        // Prime the next `frame_end`'s resync so the period is re-measured and
+        // the prediction is phase-locked against this just-confirmed boundary
+        // (the err it computes next frame is ~0, so no corrective step fires).
+        self.frames_since_resync = self.resync_every;
+    }
 }
 
 #[cfg(test)]
@@ -1502,6 +1535,8 @@ mod tests {
         next_vblank_on_advance, normalize_connector_name, phase_preserving_step, vblank_pipe_bits,
         DRM_VBLANK_HIGH_CRTC_MASK,
     };
+    use std::fs::File;
+    use std::time::Instant;
 
     /// Pins the universal (non-master, every-vendor) vblank wait: the sequence
     /// counter advancing is what reports "the next vblank has occurred".  A
@@ -1546,6 +1581,57 @@ mod tests {
         let _ = phase_preserving_step(current, just_under_half, period);
         // A genuine sub-slot residual (say a +3us real drift) IS corrected.
         assert_eq!(phase_preserving_step(current, current + 3, period), 3);
+    }
+
+    /// Pins the acquisition-storm fix: `resync_to_vblank` establishes the
+    /// armed prediction on the display grid itself, then the next `frame_end`
+    /// confirms against the following vblank with err ~ 0 -- the phase-lock
+    /// keeps the grid instead of folding it a half-period off.  This is the
+    /// deterministic alternative to letting a frozen, stale-phase prediction
+    /// survive `frame_start`'s whole-period snaps at content start (which
+    /// parked the confirmed-grid FIFO pins just past the armed due window and
+    /// ignited the overdue/re-anchor storm).
+    #[test]
+    fn resync_to_vblank_pins_prediction_onto_the_confirmed_grid() {
+        let f = File::open("/dev/null").expect("open /dev/null for a dummy fd");
+        let mut d = super::DrmVblank {
+            fd: f.into(),
+            pipe: 0,
+            crtc_id: 0,
+            modern: false,
+            period_us: 8_333,
+            next_present_us: 123_456, // stale, off the confirmed grid
+            confirmed_us: 0,
+            frames_since_resync: 0,
+            resync_every: 150,
+            last_resync_us: 0,
+            last_resync_frames: 0,
+            epoch_instant: Instant::now(),
+            real_epoch_offset_us: 0,
+            synced: false,
+            broken: false,
+            connector: None,
+            resync_count: 0,
+            resync_err_total: 0,
+            resync_err_max_abs: 0,
+        };
+        // Confirm a real vblank and pin the prediction to its next real slot.
+        d.resync_to_vblank(100_000);
+        assert_eq!(d.next_present_us, 108_333, "armed = confirmed + period");
+        assert_eq!(d.confirmed_us, 100_000, "confirmed reference grounded");
+        assert_eq!(
+            d.frames_since_resync, 150,
+            "next frame_end performs the full period re-measurement"
+        );
+
+        // Steering frame_end with the NEXT confirmed vblank (one period later)
+        // leaves the prediction exactly on the grid: raw err is 0, the nudge
+        // adds nothing and the resync step normalizes to 0 as well, so the
+        // re-anchored phase is preserved (no half-period fold).
+        d.synced = true;
+        d.frame_end(Some(108_333));
+        assert_eq!(d.next_present_us, 116_666, "frame advance keeps the grid");
+        assert_eq!(d.confirmed_us, 108_333);
     }
 
     #[test]
